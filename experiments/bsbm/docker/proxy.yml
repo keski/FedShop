@@ -1,10 +1,7 @@
 services:
   fedshop-proxy:
-    image: minhhoangdang/fedshop-proxy:spring
-    environment:
-      - NO_PROXY=host.docker.internal,localhost,127.0.0.0/8
+    image: minhhoangdang/fedshop-proxy:latest
     ports:
       - 5555:8080
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    entrypoint: 'mvn exec:java -Dexec.mainClass="com.fedshop.proxy.SpringProxy" -Dserver.port=8080'

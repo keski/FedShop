@@ -6,12 +6,61 @@ import shutil
 import subprocess
 import click
 from utils import load_config, fedshop_logger
+import requests
+import time
 
 logger = fedshop_logger(Path(__file__).name)
 
 @click.group
 def cli():
     pass
+
+@cli.command()
+@click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--clean", is_flag=True, default=False)
+@click.option("--cores", type=click.INT, default=1, help="The number of cores used allocated. -1 if use all cores.")
+@click.option("--rerun-incomplete", is_flag=True, default=False)
+@click.option("--touch", is_flag=True, default=False)
+@click.option("--no-cache", is_flag=True, default=False)
+@click.option("--dry-run", is_flag=True, default=False)
+@click.pass_context
+def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch, no_cache, dry_run):
+    """Ingest the data
+
+    Args:
+        mode (_type_): Either "generate" or "evaluate"
+        op (_type_): Either "debug" or "clean"
+    """
+    
+    if no_cache:
+        shutil.rmtree(".snakemake")
+
+    if cores == -1: cores = "all"
+
+    CONFIG = load_config(configfile)["generation"]
+    WORK_DIR = CONFIG["workdir"]
+
+    INGESTION_SNAKEFILE = f"{WORK_DIR}/snakefile/ingest-data.smk"
+    WORKFLOW_DIR = f"{WORK_DIR}/rulegraph"
+    os.makedirs(name=WORKFLOW_DIR, exist_ok=True)
+
+    SNAKEMAKE_OPTS = f"-p --cores {cores} --config configfile={configfile}"
+    if rerun_incomplete: SNAKEMAKE_OPTS += " --rerun-incomplete"
+    if dry_run: SNAKEMAKE_OPTS += " --dry-run"
+    
+    if touch:
+        logger.info("Marking files as completed...")
+        shutil.rmtree(".snakemake", ignore_errors=True)
+        SNAKEMAKE_OPTS += " --touch"
+
+    if clean:
+        logger.info("Cleaning...")
+        ctx.invoke(wipe, configfile=configfile, level="all")
+
+    logger.info("Ingesting data...")
+    cmd = f"snakemake {SNAKEMAKE_OPTS} --snakefile {INGESTION_SNAKEFILE}"
+    logger.debug(cmd)
+    if os.system(cmd) != 0 : exit(1)
 
 @cli.command()
 @click.argument("category", type=click.Choice(["data", "queries"]))
@@ -42,7 +91,11 @@ def generate(ctx: click.Context, category, configfile, debug, clean, cores, reru
 
     N_BATCH=CONFIG["n_batch"]
 
-    GENERATION_SNAKEFILE=f"{WORK_DIR}/generate-{category}.smk"
+    GENERATION_SNAKEFILE= (
+        f"{WORK_DIR}/snakefile/generate-data.smk" 
+        if category == "data" 
+        else "snakemake/generate-queries.smk"
+    )
 
     WORKFLOW_DIR = f"{WORK_DIR}/rulegraph"
     os.makedirs(name=WORKFLOW_DIR, exist_ok=True)
@@ -62,15 +115,8 @@ def generate(ctx: click.Context, category, configfile, debug, clean, cores, reru
         ctx.invoke(wipe, configfile=configfile, level=clean)
 
     for batch in range(1, N_BATCH+1):
-        if debug:
-            logger.info("Producing rulegraph...")
-            RULEGRAPH_FILE = f"{WORKFLOW_DIR}/rulegraph_generate_batch{batch}"
-            if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {GENERATION_SNAKEFILE} --debug-dag --batch merge_metrics={batch}/{N_BATCH}") != 0 : exit(1)
-            if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {GENERATION_SNAKEFILE} --rulegraph > {RULEGRAPH_FILE}.dot") != 0 : exit(1)
-            if os.system(f"dot -Tpng {RULEGRAPH_FILE}.dot > {RULEGRAPH_FILE}.png") != 0 : exit(1)
-        else:
-            logger.info(f"Producing metrics for batch {batch}/{N_BATCH}...")
-            if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {GENERATION_SNAKEFILE} --batch merge_metrics={batch}/{N_BATCH}") != 0 : exit(1)
+        logger.info(f"Producing metrics for batch {batch}/{N_BATCH}...")
+        if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {GENERATION_SNAKEFILE} --batch merge_metrics={batch}/{N_BATCH}") != 0 : exit(1)
 
 @cli.command()
 @click.argument("experiment-dir", type=click.Path(exists=True, file_okay=False, dir_okay=True))
@@ -119,7 +165,7 @@ def evaluate(ctx: click.Context, configfile, config, debug, clean, cores, rerun_
     WORK_DIR = GEN_CONFIG["workdir"]
     BENCH_DIR = f"{WORK_DIR}/benchmark/evaluation"
 
-    EVALUATION_SNAKEFILE=f"{WORK_DIR}/evaluate.smk"
+    EVALUATION_SNAKEFILE=f"snakemake/evaluate.smk"
     SNAKEMAKE_CONFIGS = f"configfile={configfile} "
     SINGLE_QUERY_MODE = False
     SNAKEMAKE_CONFIG_MATCHER = None
@@ -293,6 +339,36 @@ def wipe(configfile, level: str):
     elif "benchmark" in args:
         remove_benchmark()
 
+@cli.command()
+@click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+def setup(configfile):
+    # Launch virtuoso
+    config = load_config(configfile)
+    virtuoso_config = config["generation"]["virtuoso"]
+    virtuoso_endpoint = virtuoso_config["default_endpoint"]
+
+    try:
+        while requests.get(virtuoso_endpoint).status_code != 200:
+            print("Virtuoso is not running. Please turn it on manually.")
+            time.sleep(5)
+    except: pass
+
+    # Launch the proxy server
+    proxy_config = config["evaluation"]["proxy"]
+    proxy_endpoint = proxy_config["endpoint"]
+    proxy_compose_file = proxy_config["compose_file"]
+    proxy_service_name = proxy_config["service_name"]
+
+    cmd = f"docker-compose -f {proxy_compose_file} up -d {proxy_service_name}"
+    if os.system(cmd) != 0 : exit(1)
+
+    try:
+        while requests.get(proxy_endpoint).status_code != 200:
+            print("Proxy server is not running. Please turn it on manually.")
+            time.sleep(5)
+    except: pass
+
+    click.echo("Setup completed!")
 
 if __name__ == "__main__":
     cli()

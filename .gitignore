@@ -163,3 +163,5 @@ engines/ARQ/jena
 fix.py
 
 experiments/**/stats/*.stat
+apache-jena-fuseki-5.0.0/
+.idea/

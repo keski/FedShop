@@ -114,10 +114,8 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
     
     config = load_config(eval_config)
     app_dir = config["evaluation"]["engines"]["anapsid"]["dir"]
-    last_batch = config["generation"]["n_batch"] - 1
     compose_file = config["generation"]["virtuoso"]["compose_file"]
     service_name = config["generation"]["virtuoso"]["service_name"]
-    container_name = config["generation"]["virtuoso"]["container_names"][last_batch]
     timeout = int(config["evaluation"]["timeout"])
     old_dir = os.getcwd()
     

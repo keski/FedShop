@@ -33,7 +33,6 @@ CONFIG_EVAL = CONFIG["evaluation"]
 
 SPARQL_COMPOSE_FILE = CONFIG_GEN["virtuoso"]["compose_file"]
 SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
-SPARQL_CONTAINER_NAMES = CONFIG_GEN["virtuoso"]["container_names"]
 
 PROXY_COMPOSE_FILE =  CONFIG_EVAL["proxy"]["compose_file"]
 PROXY_SERVICE_NAME = CONFIG_EVAL["proxy"]["service_name"]
@@ -94,7 +93,7 @@ def activate_one_container(batch_id):
         is_virtuoso_restarted = utils_activate_one_container(batch_id, SPARQL_COMPOSE_FILE, SPARQL_SERVICE_NAME, LOGGER, f"{BENCH_DIR}/virtuoso-ok.txt")
 
     LOGGER.info("Activating proxy docker container...")
-    proxy_target = CONFIG_GEN["virtuoso"]["endpoints"][-1]
+    proxy_target = CONFIG_GEN["virtuoso"]["endpoints"][batch_id]
     proxy_target = proxy_target.replace("/sparql", "/")
     if ping(PROXY_SPARQL_ENDPOINT) == -1:
         LOGGER.info("Starting proxy server...")
@@ -109,7 +108,6 @@ def activate_one_container(batch_id):
         shell(f"python fedshop/engines/rsa.py warmup {CONFIGFILE}")
 
 def generate_federation_declaration(federation_declaration_file, engine, batch_id):
-    #sparql_endpoint = get_docker_endpoint_by_container_name(SPARQL_COMPOSE_FILE, SPARQL_SERVICE_NAME, SPARQL_CONTAINER_NAMES[LAST_BATCH])
     sparql_endpoint = PROXY_SPARQL_ENDPOINT
 
     LOGGER.info(f"Rewriting {engine} configfile as it is updated!")

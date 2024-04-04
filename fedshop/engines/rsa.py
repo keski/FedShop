@@ -5,13 +5,10 @@ import os
 import random
 import re
 import shutil
-import tempfile
 import time
 import click
 import glob
-import subprocess
 import pandas as pd
-import numpy as np
 from pathlib import Path
 
 import sys
@@ -21,7 +18,7 @@ import requests
 from tqdm import tqdm
 sys.path.append(str(os.path.join(Path(__file__).parent.parent)))
 
-from utils import activate_one_container, check_container_status, load_config, fedshop_logger, wait_for_container, create_stats
+from utils import load_config, fedshop_logger, create_stats
 from query import write_query, exec_query_on_endpoint
 
 logger = fedshop_logger(Path(__file__).name)
@@ -55,17 +52,7 @@ def prerequisites(ctx: click.Context, eval_config):
     os.chdir(config["evaluation"]["engines"]["rsa"]["dir"])
     os.system("sh setup.sh")
     os.chdir(current_pwd)
-    
-    # Start fuseki server
-    compose_file = config["evaluation"]["engines"]["rsa"]["compose_file"]
-    service_name = config["evaluation"]["engines"]["rsa"]["service_name"]
-    container_name = config["evaluation"]["engines"]["rsa"]["container_name"]
-    batch_id = config["generation"]["n_batch"] - 1
-    if check_container_status(compose_file, service_name, container_name) != "running":
-        if os.system(f"docker-compose -f {compose_file} up -d --force-recreate jena-fuseki") != 0:
-            raise RuntimeError("Could not launch Jena server...")
-    
-    wait_for_container(config["generation"]["virtuoso"]["endpoints"][-1], "/dev/null", logger)
+
     #ctx.invoke(warmup, eval_config=eval_config)
     
     # Compile and install fedup
@@ -204,8 +191,7 @@ def create_service_query(ctx: click.Context, eval_config, query, query_plan, for
     """
     conf = load_config(eval_config)
     fedup_dir = conf["evaluation"]["engines"]["rsa"]["fedup_dir"]
-    proxy_server = conf["evaluation"]["proxy"]["endpoint"]
-    remote = proxy_server + "sparql?default-graph-uri=" 
+    remote = conf["generation"]["virtuoso"]
         
     query = os.path.realpath(query)
     query_plan = os.path.realpath(query_plan)
