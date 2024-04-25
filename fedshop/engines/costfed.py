@@ -17,7 +17,7 @@ import psutil
 import sys
 sys.path.append(str(os.path.join(Path(__file__).parent.parent)))
 
-from utils import check_container_status, load_config, fedshop_logger, str2n3, create_stats, create_stats
+from utils import load_config, fedshop_logger, str2n3, create_stats
 import fedx
 
 logger = fedshop_logger(Path(__file__).name)
@@ -54,17 +54,15 @@ def prerequisites(ctx: click.Context, eval_config):
 
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
-@click.argument("engine-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.argument("query", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.option("--out-result", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--out-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--query-plan", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--stats", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
-@click.option("--force-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="")
 @click.option("--batch-id", type=click.INT, default=-1)
 @click.option("--noexec", is_flag=True, default=False)
 @click.pass_context
-def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, force_source_selection, batch_id, noexec):
+def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec):
     """Execute the workload instance then its associated source selection query.
     
     Expected output:
@@ -75,28 +73,22 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
     Args:
         ctx (click.Context): _description_
         eval_config (_type_): _description_
-        engine_config (_type_): _description_
         query (_type_): _description_
         out_result (_type_): The file that holds results of the input query
         out_source_selection (_type_): The file that holds engine's source selection
         query_plan (_type_): _description_
         stats (_type_): _description_
-        force_source_selection (_type_): _description_
         batch_id (_type_): _description_
     """
     
     config = load_config(eval_config)
     app_config = config["evaluation"]["engines"]["costfed"]
     app = app_config["dir"]
-    last_batch = int(config["generation"]["n_batch"]) - 1
     
-    compose_file = config["generation"]["virtuoso"]["compose_file"]
-    service_name = config["generation"]["virtuoso"]["service_name"]
-    container_name = config["generation"]["virtuoso"]["container_names"][last_batch]
     timeout = int(config["evaluation"]["timeout"])
     
     proxy_server = config["evaluation"]["proxy"]["endpoint"]
-    proxy_sparql_endpoint = proxy_server + "sparql"
+    endpoints_file = f"summaries/endpoints_batch{batch_id}.txt"
     
     # Reset the proxy stats
     if requests.get(proxy_server + "reset").status_code != 200:
@@ -110,7 +102,7 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
     Path(out_source_selection).touch()
     Path(query_plan).touch()
 
-    cmd = f"./costfed.sh costfed/costfed.props {proxy_sparql_endpoint} ../../{out_result} ../../{out_source_selection} ../../{query_plan} {timeout} ../../{query} {out_result.split('/')[7].split('_')[1]} false true {summary_file} {str(noexec).lower()}"
+    cmd = f'mvn exec:java -Dhttp.proxyHost="localhost" -Dhttp.proxyPort="5555" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.aksw.simba.start.QueryEvaluation" -Dexec.args="costfed/costfed.props ../../{out_result} ../../{out_source_selection} ../../{query_plan} {timeout} {summary_file} ../../{query} {str(noexec).lower()} {endpoints_file}" -pl costfed'
 
     logger.debug("=== CostFed ===")
     logger.debug(cmd)
@@ -132,15 +124,7 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
             failed_reason = "error_runtime"
             
     except subprocess.TimeoutExpired: 
-        logger.exception(f"{query} timed out!")
-        if (container_status := check_container_status(compose_file, service_name, container_name)) != "running":
-            logger.debug(container_status)
-            raise RuntimeError("Backend is terminated!")
-        
-        # Counter-measure for issue #41 (https://github.com/mhoangvslev/FedShop/issues/41)
-        if psutil.virtual_memory().percent >= 60:
-            os.system(f"docker stop {container_name}")
-        
+        logger.exception(f"{query} timed out!")        
         failed_reason = "timeout"
     finally:
         os.system('pkill -9 -f "costfed/target"')
@@ -257,8 +241,14 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
         return result
 
     def extract_source_selection(x):
-        fex_pattern = r"StatementSource\s+\(id=sparql_localhost\:[0-9]+_sparql_\?default-graph-uri=([a-z]+(\.\w+)+\.[a-z]+)_;\s+type=[A-Z]+\)"
-        result = [ cgroup[0] for cgroup in re.findall(fex_pattern, x) ]
+        # Find all instances of "StatementSource (id=sparql_localhost:1234_ratingsite0_sparql; type=REMOTE);" 
+        fex_pattern = r"StatementSource\s+\(id=((\w|:)+);\s+type=[A-Z]+\)"
+        
+        # Convert sparql_localhost:34218_vendor8_sparql into http://localhost:34218/sparql
+        result = [ 
+            cgroup[0].replace("sparql_", "http://").replace("_", "/")
+            for cgroup in re.findall(fex_pattern, x) 
+        ]
         return result
     
     def lookup_composition(x: str):
@@ -272,33 +262,32 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
         return decoded
     
     in_df = pd.read_csv(infile)
-    #print(in_df)
     
-    with open(prefix_cache, "r") as prefix_cache_fs, open(os.path.join(Path(prefix_cache).parent, "provenance.sparql.comp"), "r") as comp_fs:
+    with open(prefix_cache, "r") as prefix_cache_fs, open(os.path.join(Path(prefix_cache).parent, "composition.json"), "r") as comp_fs:
         prefix2alias = json.load(prefix_cache_fs)    
         composition = json.load(comp_fs)
         inv_composition = {f"{' '.join(v)}": k for k, v in composition.items()}
             
         out_df = None
         for key in in_df.keys():
-
-            in_df[str("triple"+str(key))] = in_df[str(key)].apply(extract_triple)
-            in_df[str("tp_name"+str(key))] = in_df[str("triple"+str(key))].apply(lookup_composition)
-            in_df[str("tp_number"+str(key))] = in_df[str("tp_name"+str(key))].str.replace("tp", "", regex=False).astype(int)
-            in_df.sort_values(str("tp_number"+str(key)), inplace=True)
-            in_df[str("source_selection"+str(key))] = in_df[str(key)].apply(extract_source_selection)
+                        
+            in_df[f"triple{key}"] = in_df[str(key)].apply(extract_triple)
+            in_df[f"tp_name{key}"] = in_df[f"triple{key}"].apply(lookup_composition)
+            in_df[f"tp_number{key}"] = in_df[f"tp_name{key}"].str.replace("tp", "", regex=False).astype(int)
+            in_df.sort_values(f"tp_number{key}", inplace=True)
+            in_df[f"source_selection{key}"] = in_df[str(key)].apply(extract_source_selection)
 
             # If unequal length (as in union, optional), fill with nan
-            max_length = in_df[str("source_selection"+str(key))].apply(len).max()
-            in_df[str("source_selection"+str(key))] = in_df[str("source_selection"+str(key))].apply(pad)
-
+            max_length = in_df[f"source_selection{key}"].apply(len).max()
+            in_df[f"source_selection{key}"] = in_df[f"source_selection{key}"].apply(pad)
+            
             if str(key) == "Result #0":
-                out_df = in_df.set_index(str("tp_name"+str(key)))[str("source_selection"+str(key))] \
+                out_df = in_df.set_index(f"tp_name{key}")[f"source_selection{key}"] \
                     .to_frame().T \
                     .apply(pd.Series.explode) \
                     .reset_index(drop=True) 
             else: 
-                out_temp_df = in_df.set_index(str("tp_name"+str(key)))[str("source_selection"+str(key))] \
+                out_temp_df = in_df.set_index(f"tp_name{key}")[f"source_selection{key}"] \
                     .to_frame().T \
                     .apply(pd.Series.explode) \
                     .reset_index(drop=True) 
@@ -306,13 +295,10 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
             out_df.to_csv(outfile, index=False)
 
 @cli.command()
-@click.argument("datafiles", type=click.Path(exists=True, dir_okay=False, file_okay=True), nargs=-1)
-@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("eval-config", type=click.Path(exists=True, dir_okay=False, file_okay=True))
 @click.argument("batch_id", type=click.INT)
-@click.argument("endpoint", type=str)
 @click.pass_context
-def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, batch_id, endpoint):
+def generate_config_file(ctx: click.Context, eval_config, batch_id):
     """Generate the config file for the engine
 
     Args:
@@ -321,31 +307,61 @@ def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, ba
         outfile (_type_): _description_
         endpoint (_type_): _description_
     """
-
-    summary_file = f"summaries/sum_fedshop_batch{batch_id}.n3"     
-    app_config = load_config(eval_config)["evaluation"]["engines"]["costfed"]
-    app = app_config["dir"]   
-
-    oldcwd = os.getcwd()
-    os.chdir(Path(app))        
     
-    update_summary = not os.path.exists(summary_file)
-    if not update_summary:
-        print(f"Looking for {endpoint} in {summary_file}")
-        with open(summary_file, "r") as sfs:
-            update_summary = endpoint not in sfs.read()
+    # Load the config file
+    conf = load_config(eval_config)
+    proxy_mapping_file = conf["generation"]["virtuoso"]["proxy_mapping"]
+    proxy_mapping_file = os.path.realpath(proxy_mapping_file)
+    proxy_host = conf["evaluation"]["proxy"]["host"]
+    proxy_port = conf["evaluation"]["proxy"]["port"]
+    
+    endpoints_file = f"summaries/endpoints_batch{batch_id}.txt"
+    summary_file = f"summaries/sum_fedshop_batch{batch_id}.n3"     
+    engine_dir = conf["evaluation"]["engines"]["costfed"]["dir"]   
+    
+    oldcwd = os.getcwd()
+    os.chdir(Path(engine_dir))  
+    
+    # Generate the endpoints file
+    endpoints = []
+    with open(endpoints_file, "w") as efs, open(proxy_mapping_file, "r") as pmfs:
+        proxy_mapping = json.load(pmfs)
+        federation_members = conf["generation"]["virtuoso"]["federation_members"]
+        for federation_member_iri in federation_members[f"batch{batch_id}"].values():
+            target_endpoint = proxy_mapping[federation_member_iri]
+            endpoints.append(target_endpoint)
+            efs.write(f"{target_endpoint}\n")
+    
+    # Generate summary      
+    require_update = False 
+    if os.path.exists(summary_file):
+        if os.stat(summary_file).st_size == 0:
+            logger.debug("{summary_file} is empty! Regenerating...")
+            require_update = True
+        else:
+            with open(summary_file, "r") as sfs:
+                content = sfs.read()
+                for endpoint in endpoints:
+                    if endpoint not in content:
+                        logger.debug(f"{endpoint} not found in {summary_file}")
+                        require_update = True
+                        break
 
-    if update_summary:
+    if require_update:
         try:
             logger.info(f"Generating summary for batch {batch_id}")
-            cmd = f"./costfed.sh costfed/costfed.props {endpoint} ignore ignore ignore ignore ignore {batch_id} true false {summary_file}"
+            cmd = f'mvn exec:java -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.aksw.simba.quetsal.util.TBSSSummariesGenerator" -Dexec.args="{summary_file} {endpoints_file}" -pl costfed'
             logger.debug(cmd)
-            if os.system(cmd) != 0: raise RuntimeError(f"Could not generate {summary_file}")
+            proc = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            if proc.returncode != 0: raise RuntimeError(f"Could not generate {summary_file}")
         except InterruptedError:
             Path(summary_file).unlink(missing_ok=True)
     
+    # Modify costfed/costfed.props
+    cmd = f'sed -Ei "s#quetzal\.fedSummaries=summaries/sum_fedshop_batch[0-9]+\.n3#quetzal.fedSummaries={summary_file}#g" costfed/costfed.props'
+    if os.system(cmd) != 0: raise RuntimeError("Could not modify costfed/costfed.props")
+    
     os.chdir(oldcwd)
-    ctx.invoke(fedx.generate_config_file, datafiles=datafiles, outfile=outfile, eval_config=eval_config, endpoint=endpoint)
 
 if __name__ == "__main__":
     cli()

@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import textwrap
 import click
 import subprocess
 import pandas as pd
@@ -41,12 +42,10 @@ def prerequisites(eval_config):
         raise RuntimeError("Could not compile FedX")
     os.chdir(oldcwd)
         
-def exec_fedx(eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, force_source_selection, batch_id, noexec):
+def exec_fedx(eval_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec):
     config = load_config(eval_config)
-    app_config = config["evaluation"]["engines"]["fedx"]
-    app = app_config["dir"]
-    jar = os.path.join(app, "FedX-1.0-SNAPSHOT.jar")
-    lib = os.path.join(app, "lib/*")
+    engine_dir = config["evaluation"]["engines"]["fedx"]["dir"]
+    engine_config = f"{engine_dir}/config/config_batch{batch_id}.ttl"
     timeout = int(config["evaluation"]["timeout"])
     
     proxy_server = config["evaluation"]["proxy"]["endpoint"]
@@ -55,11 +54,11 @@ def exec_fedx(eval_config, engine_config, query, out_result, out_source_selectio
     if requests.get(proxy_server + "reset").status_code != 200:
         raise RuntimeError("Could not reset statistics on proxy!")
 
-    args = [engine_config, query, out_result, out_source_selection, query_plan, str(timeout), str(noexec).lower(), force_source_selection]
+    args = [engine_config, query, out_result, out_source_selection, query_plan, str(timeout), str(noexec).lower()]
     args = " ".join(args)
     #timeoutCmd = f'timeout --signal=SIGKILL {timeout}' if timeout != 0 else ""
     timeoutCmd = ""
-    cmd = f'{timeoutCmd} java -classpath "{jar}:{lib}" org.example.FedX {args}'.strip()
+    cmd = f'{timeoutCmd} mvn exec:java -Dexec.mainClass="org.example.FedX" -Dexec.args="{args}"'.strip()
 
     logger.debug("=== FedX ===")
     logger.debug(cmd)
@@ -103,21 +102,19 @@ def exec_fedx(eval_config, engine_config, query, out_result, out_source_selectio
 
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
-@click.argument("engine-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.argument("query", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.option("--out-result", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--out-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--query-plan", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--stats", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
-@click.option("--force-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="")
 @click.option("--batch-id", type=click.INT, default=-1)
 @click.option("--noexec", is_flag=True, default=False)
 @click.pass_context
-def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, force_source_selection, batch_id, noexec):
+def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec):
     Path(out_result).touch()
     Path(out_source_selection).touch()
     Path(query_plan).touch()
-    exec_fedx(eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, "", batch_id, noexec)
+    exec_fedx(eval_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec)
 
 @cli.command()
 @click.argument("infile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
@@ -199,7 +196,7 @@ def transform_provenance(infile, outfile, prefix_cache):
     
     in_df = pd.read_csv(infile)
         
-    with open(prefix_cache, "r") as prefix_cache_fs, open(os.path.join(Path(prefix_cache).parent, "provenance.sparql.comp"), "r") as comp_fs:
+    with open(prefix_cache, "r") as prefix_cache_fs, open(os.path.join(Path(prefix_cache).parent, "composition.json"), "r") as comp_fs:
         prefix2alias = json.load(prefix_cache_fs)    
         composition = json.load(comp_fs)
         inv_composition = {f"{' '.join(v)}": k for k, v in composition.items()}
@@ -221,52 +218,58 @@ def transform_provenance(infile, outfile, prefix_cache):
         out_df.to_csv(outfile, index=False)
 
 @cli.command()
-@click.argument("datafiles", type=click.Path(exists=True, dir_okay=False, file_okay=True), nargs=-1)
-@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("eval-config", type=click.Path(exists=True, dir_okay=False, file_okay=True))
+@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("batch_id", type=click.INT)
-@click.argument("endpoint", type=str)
 @click.pass_context
-def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, batch_id, endpoint):
+def generate_config_file(ctx: click.Context, eval_config, outfile, batch_id):
     
-    is_endpoint_updated = False
+    # Load config
+    conf = load_config(eval_config)
+    proxy_mapping_file = conf["generation"]["virtuoso"]["proxy_mapping"]
+
+    # Generate the endpoints file
+    endpoints = {}
+    with open(proxy_mapping_file, "r") as pmfs:
+        proxy_mapping = json.load(pmfs)
+        federation_members = conf["generation"]["virtuoso"]["federation_members"]
+        for federation_member_iri in federation_members[f"batch{batch_id}"].values():
+            target_endpoint = proxy_mapping[federation_member_iri]
+            endpoints[federation_member_iri] = target_endpoint
+    
+    update_required = False
     if is_file_exists := os.path.exists(outfile):
         with open(outfile) as f:
-            search_string = f'sd:endpoint "{endpoint}'
-            is_endpoint_updated = search_string not in f.read()
+            for endpoint in endpoints.values():
+                search_string = f'sd:endpoint "{endpoint}'
+                if update_required := search_string not in f.read():
+                    break
+                
 
-    if is_endpoint_updated or not is_file_exists:
-        ssite = set()
-        #for data_file in glob.glob(f'{dir_data_file}/*.nq'):
-        for data_file in datafiles:
-            with open(data_file, "r") as file:
-                t_file = file.readlines()
-                for line in t_file:
-                    site = line.rsplit()[-2]
-                    site = re.search(r"<(.*)>", site).group(1)
-                    ssite.add(site)
+    if update_required or not is_file_exists:
         
         outfile = Path(outfile)
         outfile.parent.mkdir(parents=True, exist_ok=True)
         outfile.touch()
         with outfile.open("w") as ffile:
-            ffile.write(
-"""
-@prefix sd: <http://www.w3.org/ns/sparql-service-description#> .
-@prefix fedx: <http://rdf4j.org/config/federation#> .
+            ffile.write(textwrap.dedent(
+                f"""
+                @prefix sd: <http://www.w3.org/ns/sparql-service-description#> .
+                @prefix fedx: <http://rdf4j.org/config/federation#> .
 
-"""
-            )
-            for s in sorted(ssite):
-                ffile.write(
-f"""
-<{s}> a sd:Service ;
-    fedx:store "SPARQLEndpoint";
-    sd:endpoint "{endpoint}/?default-graph-uri={s}";
-    fedx:supportsASKQueries false .   
+                """
+            ))
 
-"""
-                )
+            for graph_uri, endpoint in endpoints.items():
+                ffile.write(textwrap.dedent(
+                    f"""
+                    <{graph_uri}> a sd:Service ;
+                        fedx:store "SPARQLEndpoint";
+                        sd:endpoint "{endpoint}";
+                        fedx:supportsASKQueries false .   
+
+                    """
+                ))
 
 if __name__ == "__main__":
     cli()

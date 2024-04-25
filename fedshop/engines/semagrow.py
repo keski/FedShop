@@ -279,7 +279,7 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
     # #print(in_df)
     
     with    open(prefix_cache, "r") as prefix_cache_fs, \
-            open(os.path.join(Path(prefix_cache).parent, "provenance.sparql.comp"), "r") as comp_fs \
+            open(os.path.join(Path(prefix_cache).parent, "composition.json"), "r") as comp_fs \
     :
         prefix2alias = json.load(prefix_cache_fs)    
         composition = json.load(comp_fs)

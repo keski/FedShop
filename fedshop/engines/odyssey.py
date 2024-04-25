@@ -381,7 +381,7 @@ def transform_result(infile, outfile, prefix_cache):
     in_df = pd.read_csv(infile)
     
     prefix2alias = json.load(open(prefix_cache, "r"))    
-    composition = json.load(open(os.path.join(Path(prefix_cache).parent, "provenance.sparql.comp"), "r"))
+    composition = json.load(open(os.path.join(Path(prefix_cache).parent, "composition.json"), "r"))
     inv_composition = {f"{' '.join(v)}": k for k, v in composition.items()}
     
     def extract_triple(x):

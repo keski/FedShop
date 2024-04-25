@@ -1,0 +1,8 @@
+{
+    "ProductXYZ": {
+        "exclusive": true
+    },
+    "currentDate": {
+        "query": "`currentDate` < `date`"
+    }
+}

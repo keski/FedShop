@@ -1,23 +1,33 @@
+from copy import deepcopy
+import glob
+from itertools import chain
 import json
 from pathlib import Path
-import shutil
-from time import time
+from pprint import pprint
+import subprocess
 
 from collections import Counter
 import os
 from pathlib import Path
-from typing import Dict, Tuple
 from tqdm import tqdm
+import uuid
+
+from rdflib.term import Variable, Literal, URIRef
+from rdflib.plugins.sparql.parser import parseQuery
+from rdflib.plugins.sparql.algebra import _traverseAgg, traverse, translateQuery, pprintAlgebra
+from rdflib.plugins.sparql.parserutils import CompValue
+
+from algebra.rdflib_algebra import add_graph_to_triple_pattern, add_values_with_placeholders, collect_variables, disable_orderby_limit, extract_where, inject_constant_into_placeholders, remove_filter_with_placeholders, replace_select_projection_with_graph, translateAlgebra
+from algebra.pandas_algebra import collect_constants, parse_expr, translate_query
 
 import re
 import numpy as np
 import pandas as pd
-from SPARQLWrapper import SPARQLWrapper, CSV, DESCRIBE
-from io import BytesIO, StringIO, TextIOWrapper
-from rdflib import Literal, URIRef, XSD
+from SPARQLWrapper import SPARQLWrapper, CSV
+from io import BytesIO, StringIO
 import click
 
-from utils import load_config, fedshop_logger, str2n3
+from utils import load_config, fedshop_logger
 
 logger = fedshop_logger(Path(__file__).name)
 
@@ -33,7 +43,10 @@ tokenizer = RegexpTokenizer(r"\w+")
 
 from ftlangdetect import detect
 from iso639 import Lang
+import tempfile
 
+PANDAS_RANDOM_STATE = 42
+WDQ_BIN_PATH = "fedshop/misc/wdq"
 
 @click.group
 def cli():
@@ -91,155 +104,16 @@ def exec_query(query, endpoint, error_when_timeout=False):
     """
     return exec_query_on_endpoint(query, endpoint, error_when_timeout)
 
-
-def __parse_query(io: TextIOWrapper) -> Tuple[Dict, Dict]:
-    """Parse an input query and returns (1) prefix composition, (2) ordered parse tree for placeholders
-
-    Args:
-        io (TextIOWrapper): _description_
-
-    Returns:
-        Tuple[Dict, Dict]: _description_
-    """
-
-    parse_result = dict()
-    prefix_full_to_alias = dict()
-    prefix_full_to_alias["http://www.w3.org/2001/XMLSchema#"] = "xsd"
-    prefix_full_to_alias["http://www.w3.org/2002/07/owl#"] = "owl"
-
-    lines = io.readlines()
-    parse_result["@skip"] = []
-    for line_id, line in enumerate(lines):
-
-        if line in parse_result["@skip"]: continue
-
-        toks = np.array(re.split(r"\s+", line))
-        if "#" in toks:
-            exclusive = False
-            priority_level = 0
-
-            if "@skip" in toks:
-                parse_result["@skip"].append(lines[line_id + 1])
-
-            elif (comp := re.search(r"const([\*\!]*)\s+(\?\w+)\s+(\W+|\w+)\s+((\?\w+|\w+:\w+)(,\s*(\?\w+|\w+:\w+))*)",
-                                    line)) is not None:
-                op = comp.group(3)
-                left = comp.group(2)
-
-                priority = comp.group(1)
-                if priority is not None:
-                    priority_level = priority.count("*")
-                    exclusive = ("!" in priority)
-
-                deps = re.split(r",\s*", comp.group(4))
-
-                right = deps[0]
-                if op == "$!":
-                    right = deps.pop(0)
-                elif op == "!=":
-                    right = left
-
-                parse_result[left] = {
-                    "priority": priority_level,
-                    "exclusive": exclusive,
-                    "type": "comparison",
-                    "src": right,
-                    "op": op,
-                    "op_kind": "binary",
-                    "extras": deps
-                }
-
-            elif (assertion := re.search(r"const([\*\!]*)\s+(not)\s+(\?\w+)", line)) is not None:
-                op = assertion.group(2)
-                left = assertion.group(3)
-
-                priority = assertion.group(1)
-                if priority is not None:
-                    priority_level = priority.count("*")
-                    exclusive = ("!" in priority)
-
-                parse_result[left] = {
-                    "priority": priority_level,
-                    "exclusive": exclusive,
-                    "type": "assertion",
-                    "op": op,
-                    "op_kind": "unary"
-                }
-            else:
-                const_search = re.search(r"const([\*\!]*)\s+(\?\w+)", line)
-                if const_search is not None:
-                    left = const_search.group(2)
-
-                    priority = const_search.group(1)
-                    if priority is not None:
-                        priority_level = priority.count("*")
-                        exclusive = ("!" in priority)
-
-                    parse_result[left] = {
-                        "priority": priority_level,
-                        "exclusive": exclusive,
-                        "type": None
-                    }
-            continue
-
-        elif "PREFIX" in toks:
-            regex = r"PREFIX\s+([\w\-]+):\s*<(.*)>\s*"
-            alias = re.search(regex, line).group(1)
-            full_name = re.search(regex, line).group(2)
-            prefix_full_to_alias[full_name] = alias
-
-    # Order the parse tree by placeholder priority
-    parse_result = dict(sorted(parse_result.items(),
-                               key=lambda item: 0 if item[0] == "@skip" else item[1]["priority"], reverse=True))
-    return prefix_full_to_alias, parse_result
-
-
-def __parse_query_from_file(queryfile) -> Tuple[Dict[str, str], Dict[str, Dict]]:
-    """Parse input queryfile into get placeholders
-
-    Args:
-        queryfile (_type_): _description_
-
-    Returns:
-        _type_: subDict containing constant, their depending contants and a prefix dictionary
-    """
-
-    with open(queryfile, mode="r") as qfs:
-        return __parse_query(qfs)
-
-
-def __get_uninjected_placeholders(queryfile, exclusive=False):
-    """Returns a set of available placeholders (not yet injected).
-
-    Args:
-        queryfile (_type_): input queryfile to read from.
-        exclusive (bool, optional): If set to True, only return constants that require to be injected exclusively. If False, return all placeholders. Defaults to False.
-
-    Returns:
-        _type_: a set of available placeholders (not yet injected)
-    """
-    _, parse_result = __parse_query_from_file(queryfile)
-
-    consts = set()
-    for const, resource in parse_result.items():
-        if const == "@skip": continue
-        c = const if (resource["type"] is None or resource.get("src") is None) else resource["src"]
-        if c.startswith("?"):
-            if exclusive and resource.get("exclusive"):
-                consts.add(c)
-            elif not exclusive:
-                consts.add(c)
-    return consts
-
-
 @cli.command()
-@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("endpoint", type=click.STRING)
+@click.option("--queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--querydata", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.option("--sample", type=click.INT)
+@click.option("--seed", type=click.INT, default=PANDAS_RANDOM_STATE)
 @click.option("--ignore-errors", is_flag=True, default=False)
 @click.option("--dropna", is_flag=True, default=False)
-def execute_query(queryfile, outfile, endpoint, sample, ignore_errors, dropna):
+def execute_query(endpoint, queryfile, querydata, outfile, sample, seed, ignore_errors, dropna):
     """Execute query, export to an output file and return number of rows .
 
     Args:
@@ -255,507 +129,238 @@ def execute_query(queryfile, outfile, endpoint, sample, ignore_errors, dropna):
     Returns:
         [type]: the number of rows
     """
-    with open(queryfile, mode="r") as qf:
-        query_text = qf.read()
+    
+    query_text = querydata
+    if queryfile:
+        with open(queryfile, mode="r") as qf:
+            query_text = qf.read()
+    
+    if query_text is None:
+        raise RuntimeError("No query to execute...")
+    
+    _, result = exec_query(query=query_text, endpoint=endpoint, error_when_timeout=False)
 
-        _, result = exec_query(query=query_text, endpoint=endpoint, error_when_timeout=False)
+    with BytesIO(result) as header_stream, BytesIO(result) as data_stream:
+        header = header_stream.readline().decode().strip().replace('"', '').split(",")
+        csvOut = pd.read_csv(data_stream, parse_dates=[h for h in header if "date" in h])
 
-        with BytesIO(result) as header_stream, BytesIO(result) as data_stream:
-            header = header_stream.readline().decode().strip().replace('"', '').split(",")
-            csvOut = pd.read_csv(data_stream, parse_dates=[h for h in header if "date" in h])
+        if csvOut.empty and not ignore_errors:
+            logger.error(query_text)
+            raise RuntimeError(f"{queryfile} returns no result...")
 
-            if csvOut.empty and not ignore_errors:
-                logger.error(query_text)
-                raise RuntimeError(f"{queryfile} returns no result...")
+        if dropna:
+            csvOut.dropna(inplace=True)
 
-            if dropna:
-                csvOut.dropna(inplace=True)
+        if sample is not None:
+            csvOut = csvOut.sample(sample, random_state=seed)
 
-            if sample is not None:
-                csvOut = csvOut.sample(sample)
-
-            # if ("DISTINCT" in query_text or "distinct" in query_text) and csvOut.duplicated().any():
-            #     logger.error(query_text)
-            #     logger.error(csvOut[csvOut.duplicated()])
-            #     raise RuntimeError(f"{queryfile} has duplicates!")
-            #     csvOut.drop_duplicates(inplace=True)
-
+        if outfile: 
             csvOut.to_csv(outfile, index=False)
 
-            return csvOut.shape[0]
+        return csvOut
 
-
-@cli.command()
-@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
-def build_value_selection_query(queryfile, outfile):
-    """From an input query, generate a selection pool of values for placeholders
-    TODO:
-        [] avoid running big query using ORDER BY RAND() LIMIT n
-    Args:
-        queryfile (_type_): input query
-        n_variations (_type_): number of variations
-
-    Returns:
-        _type_: a csv file at outfile containing values for placeholders
-    """
-
-    optimized = f"{Path(queryfile).parent}/{Path(queryfile).stem}.injected.opt"
-    if os.path.exists(optimized):
-        logger.info(f"Use optimized version {optimized} instead...")
-        queryfile = optimized
-
-    consts = __get_uninjected_placeholders(queryfile, exclusive=True)
-    if len(consts) == 0:
-        consts = __get_uninjected_placeholders(queryfile, exclusive=False)
-    logger.debug(consts)
-
-    with open(queryfile, "r") as qf:
-        query = qf.read()
-        query = re.sub(r"(SELECT|CONSTRUCT|DESCRIBE)(\s+DISTINCT)?\s+(.*)\s+WHERE",
-                       f"SELECT DISTINCT {' '.join(consts)} WHERE", query)
-        # query = re.sub(r"((\?\w+|\w+:\w+|<\S+>)\s+(\?\w+|a|\w+:\w+|<\S+>)\s+(<\S+>))", r"##\1", query)
-        query = re.sub(r"(#)*(LIMIT|FILTER|OFFSET|ORDER)", r"##\2", query)
-
-        write_query(query, outfile)
-
-        return query
-
-
-def write_query(query, outfile):
-    """Restore lines marked with "@skip", rewrite "ORDER BY" and export a query into a file. 
-
-    Args:
-        query (_type_): the content
-        outfile (_type_): the output file
-
-    Returns:
-        _type_: the input query
-    """
-
-    _, parse_result = __parse_query(StringIO(query))
-
-    # Restore every disabled line if marked
-    for skipline in parse_result["@skip"]:
-        skipline_sub = re.sub(r"(#)*", r"", skipline)
-        query = re.sub(re.escape(skipline), skipline_sub, query)
-
-    # If there is a ORDER BY, make it ORDER BY (all projected columns)
-    if "ORDER BY" in query:
-        if (projection_search := re.search(r"SELECT([\S\s]+)WHERE", query)) is not None:
-            projection = re.findall(r"\?\w+", projection_search.group(1).strip())
-
-            if projection == "*":
-                projection = re.findall(r"\?\w+", query)
-
-            query = re.sub(r"ORDER BY(.*)", f"ORDER BY {' '.join(projection)}", query)
-
-    with open(outfile, "w") as out_fs:
-        out_fs.write(query)
-
-    return query
-
-
-@cli.command()
-@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("cache-file", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("outputfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
-def inject_from_cache(queryfile, cache_file, outputfile):
-    with open(queryfile, "r") as qf:
-        query = qf.read()
-        injection_cache = pd.read_json(cache_file, convert_dates=True, typ="series")
-
-        for variable, value in injection_cache.items():
-            # Convert to n3 representation
-            value = str2n3(value)
-            prefix_full_to_alias = json.load(open(f"{Path(cache_file).parent}/prefix_cache.json", 'r'))
-            for prefix_full_name, prefix_alias in prefix_full_to_alias.items():
-                if prefix_full_name in value:
-                    value = re.sub(rf"<{prefix_full_name}(\w+)>", rf"{prefix_alias}:\1", value)
-                    missing_prefix = f"PREFIX {prefix_alias}: <{prefix_full_name}>"
-                    if re.search(re.escape(missing_prefix), query) is None:
-                        query = f"PREFIX {prefix_alias}: <{prefix_full_name}>" + "\n" + query
-
-            query = re.sub(rf"{re.escape('?' + variable)}(\W)", rf"{value}\1", query)
-
-        query = re.sub(r"(regex|REGEX)\s*\(\s*(\?\w+)\s*,", r"\1(lcase(str(\2)),", query)
-        query = re.sub(r"#*(DEFINE|OFFSET)", r"##\1", query)
-
-        if "provenance" in queryfile:
-            query = re.sub(r"#*(ORDER|LIMIT)", r"##\1", query)
-
-        write_query(query, outputfile)
-
-
-@cli.command()
-@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("value-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.option("--ignore-errors", is_flag=True, default=False)
-@click.option("--instance-id", type=click.INT)
-def inject_constant(queryfile, value_selection, ignore_errors, instance_id):
-    """Inject constant in placeholders for a query template.
+def pretty_print_query(queryfile):
+    cmd = f"./{WDQ_BIN_PATH} --no-execute --language en --query {queryfile}"
+    logger.debug(f"wdq comamnd: {cmd}")
+    proc = subprocess.run(cmd, shell=True, capture_output=True)
+    return proc.stdout.decode()
     
-    - For every uninjected constant, ordered by priotity: 
-        - If this is the first injection, or the operator is unary, inject with the `instance_id `-th row of `value_selection`
-        - Else, each operator has its own rule to inject missing constants:
-            - Comparison op, e.g, ?a > ?b: first try to select random value constrained by the operator
-            - Dependant-difference ($!) or independant-different (!=): choose randomly a value that is different to injected constant 
-            - Containment ("in"): choose randomly one out of 10 least common words
-
-    Args:
-        queryfile ([type]): [description]
-        value_selection ([type]): [description]
-        instance_id ([type]): [description]
-        ignore_errors ([type]): [description]
-
-    Raises:
-        RuntimeError: [description]
-
-    Returns:
-        [type]: [description]
-    """
-
-    qroot = Path(queryfile).parent
-    with open(queryfile, "r") as qf:
-        query = qf.read()
-
-        prefix_cache_filename = f"{qroot}/prefix_cache.json"
-        injection_cache_filename = f"{qroot}/injection_cache.json"
-        injection_cache: dict = json.load(open(injection_cache_filename, "r")) if os.path.exists(
-            injection_cache_filename) else dict()
-
-        flr = open(value_selection, "r")
-        header = flr.readline().strip().replace('"', '').split(",")
-        flr.close()
-
-        value_selection_values = pd.read_csv(value_selection, parse_dates=[h for h in header if "date" in h])
-        placeholder_chosen_values = value_selection_values
-        placeholder_chosen_values_idx = instance_id
-
-        prefix_full_to_alias, parse_result = __parse_query_from_file(queryfile)
-        prefix_alias_to_full = {v: k for k, v in prefix_full_to_alias.items()}
-
-        for const, resource in parse_result.items():
-
-            if const == "@skip": continue
-
-            # Replace all tokens in subDict
-            isOpUnary = (resource["type"] is None or resource.get("src") is None)
-            left = right = const[1:] if isOpUnary else resource.get("src")[1:]
-            if not isOpUnary:
-                left = const[1:]
-                right = resource.get("src")[1:]
-
-            if right not in value_selection_values.columns:
-                msg = f"Column {right} is not in {value_selection}..."
-                if ignore_errors:
-                    logger.debug(msg)
-                    continue
-                else:
-                    raise RuntimeError(msg)
-
-            # When not using workload value_selection_query, i.e, filling partially injected queries
-            placeholder_chosen_values = value_selection_values.query(f"`{right}` == `{right}`")
-            if len(placeholder_chosen_values) == 0:
-                if ignore_errors:
-                    continue
-                else:
-                    raise RuntimeError(f"There is no value for `{right}` in {value_selection}")
-
-            # When instance_id is not specified, choose randomly
-            # if instance_id is None and (
-            #     placeholder_chosen_values_idx is None or 
-            #     placeholder_chosen_values_idx not in placeholder_chosen_values.index.values
-            # ):
-            #     placeholder_chosen_values_idx = placeholder_chosen_values.sample(1).index.item()
-
-            # Replace for FILTER clauses
-            repl_val = placeholder_chosen_values.loc[placeholder_chosen_values_idx, right]
-            if resource["type"] is not None:
-                dtype = placeholder_chosen_values[right].dtype
-                epsilon = 0
-                # Use sigmoid function to change value slighly
-                if np.issubdtype(dtype, np.number):
-                    if np.issubdtype(dtype, np.number):
-                        epsilon = 1
-                    else:
-                        # epsilon = # Do something here
-                        raise ValueError(f"{right} is of type {dtype}, which is not yet supported")
-                elif np.issubdtype(dtype, np.datetime64):
-                    epsilon = pd.Timedelta(1, unit="day")
-
-                # Implement more operators here
-                op = resource["op"]
-                if (op_search := re.match(r"(\<|\>)=?", op)) is not None:
-                    # Option 1: Chose randomly another value filtered by chosen value
-                    try:
-                        repl_val = placeholder_chosen_values.query(f"`{right}` {op} {repr(repl_val)}").sample(1)[right]
-                    except:
-                        pass
-
-                    # Option 2: substract/add a small amount to a chosen value so the query yield result
-                    sub_op = op_search.group(1)
-                    if sub_op == ">":
-                        repl_val += epsilon
-                    elif sub_op == "<":
-                        repl_val -= epsilon
-
-                # elif op == "$":
-                #     repl_val = placeholder_chosen_values.loc[placeholder_chosen_values_idx, right]
-
-                elif op == "!=" and instance_id is None:
-                    constraints = []
-                    for extra in resource.get("extras"):
-                        if str(extra).startswith("?"):
-                            r_extra = extra[1:]
-                            constraint = f"`{left}` != {repr(injection_cache[r_extra])}"
-                            constraints.append(constraint)
-                        else:
-                            if (prefix_search := re.search(r"([\w\-]+):(\w+)", extra)) is not None:
-                                prefix_alias = prefix_search.group(1)
-                                suffix = prefix_search.group(2)
-                                prefix_full_name = prefix_alias_to_full[prefix_alias]
-
-                                formatted_extra = f"{prefix_full_name}{suffix}"
-                                constraint = f"`{left}` != {repr(formatted_extra)}"
-                                constraints.append(constraint)
-
-                    if len(constraints) > 0:
-                        constraint_query = " and ".join(constraints)
-                        logger.debug(constraint_query)
-                        repl_val = placeholder_chosen_values.query(constraint_query)[right].sample(1)
-
-                elif op == "$!" and instance_id is None:
-                    targetCol = left
-                    if bool(injection_cache) and left not in injection_cache and right in injection_cache:
-                        targetCol = right
-
-                    if bool(injection_cache):
-                        constraints = []
-                        if targetCol in injection_cache:
-                            constraints.append(f"`{targetCol}` != {repr(injection_cache[targetCol])}")
-
-                        for extra in resource.get("extras"):
-                            if str(extra).startswith("?"):
-                                r_extra = extra[1:]
-                                constraint = f"`{left}` != {repr(injection_cache[r_extra])}"
-                                constraints.append(constraint)
-                            else:
-                                if (prefix_search := re.search(r"([\w\-]+):(\w+)", extra)) is not None:
-                                    prefix_alias = prefix_search.group(1)
-                                    suffix = prefix_search.group(2)
-                                    prefix_full_name = prefix_alias_to_full[prefix_alias]
-
-                                    formatted_extra = f"{prefix_full_name}{suffix}"
-                                    constraint = f"`{left}` != {repr(formatted_extra)}"
-                                    constraints.append(constraint)
-                        if len(constraints) > 0:
-                            constraint_query = " and ".join(constraints)
-                            logger.debug(constraint_query)
-                            repl_val = placeholder_chosen_values.query(constraint_query)[right].sample(1)
-
-                # Special treatment for REGEX
-                #   Extract randomly 1 from 10 most common words in the result list
-                elif op == "in" and (not Path(value_selection).stem.startswith("workload") or instance_id is not None):
-
-                    langs = placeholder_chosen_values[right].apply(lambda x: lang_detect(x))
-                    for lang in set(langs):
-                        try:
-                            stopwords.extend(nltk_stopwords.words(lang))
-                        except:
-                            continue
-
-                    words = [
-                        token for token in
-                        tokenizer.tokenize(str(placeholder_chosen_values[right].str.cat(sep=" ")).lower())
-                        if token not in stopwords
-                    ]
-
-                    # Option 1: Choose randomly amongst 10 most common words
-                    bow = Counter(words)
-                    bow = Counter({k: v for k, v in bow.items() if k not in stopwords})
-                    repl_val = pd.Series(bow).nsmallest(10).sample(1).index.item()
-
-                    # Option 2: Choose randomly amongst words
-                    # repl_val = np.random.choice(words)
-
-                # # Special treatment for exclusion
-                # # Query with every other placeholder set
-                # elif op == "not":
-                #     # From q03: user asks for products having several features but not having a specific other feature. 
-                #     exclusion_query = " and ".join([f"`{right}` != {repr(repl_val)}"] + [ f"`{k}` != {repr(v)}" for k, v in injection_cache.items() ])
-                #     repl_val = placeholder_chosen_values.query(exclusion_query)[right].sample(1)
-
-                logger.debug(f"op: {op}; isOpUnary: {isOpUnary}; left: {left}; right: {right}; val: {repl_val}")
-
-            try:
-                repl_val = repl_val.item()
-            except:
-                pass
-
-            # Should never happens, but...
-            if repl_val is None:
-                raise ValueError(f"There is no value for left = `{left}`, right = `{right}`")
-
-            # Save injection
-            if np.issubdtype(placeholder_chosen_values[right].dtype, np.datetime64):
-                injection_cache[left] = str(repl_val)
-            else:
-                injection_cache[left] = repl_val
-
-            # Convert to n3 representation
-            repl_val = str2n3(repl_val)
-
-            # Shorten string representations with detected and common prefixes
-            for prefix_full_name, prefix_alias in prefix_full_to_alias.items():
-                if prefix_full_name in repl_val:
-                    repl_val = re.sub(rf"<{prefix_full_name}(\w+)>", rf"{prefix_alias}:\1", repl_val)
-                    missing_prefix = f"PREFIX {prefix_alias}: <{prefix_full_name}>"
-                    if re.search(re.escape(missing_prefix), query) is None:
-                        query = f"PREFIX {prefix_alias}: <{prefix_full_name}>" + "\n" + query
-
-            query = re.sub(rf"{re.escape(const)}(\W)", rf"{repl_val}\1", query)
-
-        with open(injection_cache_filename, "w") as inject_cache_fs, open(prefix_cache_filename,
-                                                                          "w") as prefix_cache_fs:
-            json.dump(injection_cache, inject_cache_fs)
-            json.dump(prefix_full_to_alias, prefix_cache_fs)
-        return query, injection_cache
-
+@cli.command()
+@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+def pprint_query(queryfile):
+    res = pretty_print_query(queryfile)
+    click.echo(res)
 
 @cli.command()
-@click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("constfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
+@click.pass_context
+def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfile):
+    """
+    Builds a value selection query based on the given parameters.
+    
+    UNION: Split UNION queries into separate queries. The value selection results should be JOINED later.
+    OPTIONAL:
+
+    Args:
+        ctx (click.Context): The Click context object.
+        queryfile (str): The path to the query file.
+        outfile (str): The path to the output file.
+
+    Returns:
+        None
+    """   
+                
+    def split_union_query(node, children):
+        if isinstance(node, CompValue):
+            if node.name == "GroupOrUnionGraphPattern":
+                graphs = node["graph"]
+                
+                # Only split when it's UNION clause, i.e., there are at least 2 graphs 
+                if len(graphs) > 1:
+                    for graph in graphs:
+                        children.append([graph])
+        
+        return list(chain(*children))
+    
+    def has_constant(node, children, consts):
+        if isinstance(node, Variable):
+            return str(node) in consts
+        elif isinstance(node, CompValue):
+            if node.name == "vars":
+                return str(node["var"]) in consts
+        return any(children)
+    
+    def split_optional_query(node, children, consts):        
+        if isinstance(node, CompValue):
+            if node.name == "SelectQuery":
+                where = node["where"]
+                new_part = []
+                for subpart in where["part"]:
+                    if subpart.name == "OptionalGraphPattern":
+                        if traverse(subpart, visitPost=lambda x: has_constant(x, consts)):
+                            new_part.append([subpart["graph"]])
+                    else:
+                        new_part.append([subpart])
+                new_where = CompValue(
+                    "GroupGraphPatternSub", 
+                    part=[new_part]
+                )
+                
+                children.append([new_where])
+        
+        return list(chain(*children))
+    
+    def build_sub_query(node, union_term=None, consts=None):
+        if isinstance(node, CompValue):
+            if node.name in ["SelectQuery", "ConstructQuery", "DescribeQuery", "AskQuery"]:
+                node_args = {
+                    "modifier": "DISTINCT"
+                }
+                node_args["where"] = union_term if union_term else node["where"]
+                                
+                if consts:
+                    node_args["projection"] = consts
+                
+                return CompValue("SelectQuery", **node_args) 
+    
+    algebra, options = ctx.invoke(parse_query, queryfile=queryfile)    
+    subq_bgp_algebras = []
+
+    consts_info_file = f"{Path(queryfile).parent}/{Path(queryfile).stem}.const.json" 
+    consts_info = {}
+    with open(consts_info_file, "r") as cifs:
+        consts_info = json.load(cifs)
+    
+    cond_consts = set(consts_info.keys())
+    cond_queries = [ q.get("query") for q in consts_info.values() if len(q) > 0 and q.get("query") ]
+    if len(cond_queries) > 0:
+        cond_query_str = " and ".join(cond_queries)
+        logger.debug(f"Cond query: {cond_query_str}")
+        cond_algebra = parse_expr(cond_query_str)
+        cond_consts.update(_traverseAgg(cond_algebra, collect_constants))
+    
+    filter_consts = deepcopy(cond_consts)
+    
+    # Read and build plan
+    for const, info in consts_info.items():
+        if len(info) == 0: continue
+        # If the constant is exclusive, 
+        if info.get("exclusive") == True:
+            # The first subquery retrieve the exlusive constant
+            subq_bgp_algebras.append(
+                (
+                    "exclusive",
+                    traverse(
+                        algebra, 
+                        lambda node: build_sub_query(node, consts=[
+                            CompValue("vars", var=Variable(const))
+                        ])
+                    )
+                )
+            )
+            
+        if info.get("ignoreFilter") == True:
+            if const in filter_consts:
+                filter_consts.remove(const)
+            
+                        
+    subq_bgp_algebras.extend([
+        ("join", alg) for alg in
+        _traverseAgg(algebra, split_union_query)
+    ])
+    
+    subq_bgp_algebras.extend([
+        ("optional", alg) for alg in
+        _traverseAgg(algebra, split_optional_query, consts=cond_consts)
+    ])
+        
+    if len(subq_bgp_algebras) == 0:
+        subq_bgp_algebras = [("join", _traverseAgg(algebra, extract_where))]
+        
+    subqueries = {}
+    
+    # Write the subqueries to files
+    for subq_id, (kind, subq_bgp_algebra) in enumerate(subq_bgp_algebras):
+        subq_vars = set(map(str, _traverseAgg(subq_bgp_algebra, collect_variables))) & cond_consts
+        subq_bgp_algebra = traverse(
+            subq_bgp_algebra, 
+            visitPost=lambda x: remove_filter_with_placeholders(
+                x, consts={"query": subq_vars, "filter": filter_consts}
+            )
+        )
+        subq_bgp_algebra = traverse(subq_bgp_algebra, visitPost=disable_orderby_limit)
+        
+        if kind == "exclusive":
+            subqueries[f"sq{subq_id}"] = {
+                "kind": kind,
+                "query": export_query(subq_bgp_algebra, options, pretty=True)
+            }
+                            
+        elif kind in ["join", "optional"]:
+            subq_consts = [ CompValue("vars", var=Variable(c)) for c in subq_vars ]    
+            subq_algebra = traverse(algebra, visitPost=lambda node: build_sub_query(node, subq_bgp_algebra, subq_consts))
+            subqueries[f"sq{subq_id}"] = {
+                "kind": kind,
+                "query": export_query(subq_algebra, options, pretty=True)
+            }
+
+        else:
+            raise NotImplementedError(f"Algebra of kind {kind} is not supported!")
+        
+    with open(outfile, "w") as out_fs:
+        json.dump(subqueries, out_fs)
+
+@cli.command()
 @click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.argument("value-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("instance-id", type=click.INT)
 @click.pass_context
-def instanciate_workload(ctx: click.Context, configfile, queryfile, value_selection, outfile, instance_id):
-    """From a query template, instanciate the {instance_id}-th instance.
-
-    1. - Until all placeholders are replaced:
-    2. -    On the first iteration, inject values from the initial value_selection csv 
-            (common to all instances of the workload), produce the partially injected query.
-    3. -    On other iteration, execute the partially injected query to find the missing constants
+def instanciate_workload(ctx: click.Context, queryfile, value_selection, outfile, instance_id):
+    """
+    Instantiate a workload by injecting constant values into placeholders in a query.
 
     Args:
-        ctx (click.Context): click constant to forward to other click commands
-        queryfile (_type_): the initial queryfile
-        outfile (_type_): the final output query
-        instance_id (_type_): the query instance id with respect to workload
-        endpoint (_type_): the sparql endpoint
+        ctx (click.Context): The Click context object.
+        configfile: The path to the configuration file.
+        queryfile: The path to the query file.
+        value_selection: The path to the value selection file.
+        outfile: The path to the output file.
+        instance_id: The ID of the instance to use for injecting values.
+
+    Returns:
+        None
     """
-
-    # Load the config file
-    config = load_config(configfile)
-    virtuoso_config = config["generation"]["virtuoso"]
-    endpoint_batch0 = virtuoso_config["batch_endpoints"][0]
-
-    with open(queryfile, "r") as query_fs:
-        query = query_fs.read()
-        initial_queryfile = queryfile
-        consts = __get_uninjected_placeholders(initial_queryfile)
-        projection_search = re.search(r"((SELECT|CONSTRUCT|DESCRIBE)(\s+DISTINCT)?)\s+(.*)\s+WHERE", query)
-
-        original_projection_clause = projection_search.group(1)
-        original_projection_variables = projection_search.group(4)
-
-        qname = Path(outfile).stem
-        qroot = Path(outfile).parent
-        next_queryfile = f"{qroot}/{qname}.sparql"
-
-        solution_option = 1
-
-        itr = 0
-        while len(consts) > 0:
-            logger.debug(f"Iteration {itr}...")
-
-            # First iteration, inject value using initial value_selection of the workload
-            if itr == 0:
-                try:
-                    ctx.invoke(build_value_selection_query, queryfile=initial_queryfile, outfile=next_queryfile)
-                    # shutil.copy(initial_queryfile, next_queryfile)
-                    next_value_selection = value_selection
-                    query, injection_cache = ctx.invoke(inject_constant, queryfile=next_queryfile,
-                                                        value_selection=next_value_selection, ignore_errors=True,
-                                                        instance_id=instance_id)
-                except:
-                    continue
-            # Execute the partially injected query to find the rest of constants
-            else:
-                # Option 1: Exclude the partialy injected query to refill
-                if solution_option == 1:
-                    try:
-                        logger.debug("Option 1: Execute the partialy injected query to refill")
-                        next_value_selection = f"{qroot}/{qname}.csv"
-                        ctx.invoke(execute_query, queryfile=next_queryfile, outfile=next_value_selection,
-                                   endpoint=endpoint_batch0)
-                        query, injection_cache = ctx.invoke(inject_constant, queryfile=next_queryfile,
-                                                            value_selection=next_value_selection, ignore_errors=False)
-                    except RuntimeError:
-                        solution_option = 2
-                        continue
-
-                # Option 2: extract the needed value for placeholders from value_selection.csv
-                elif solution_option == 2:
-                    try:
-                        logger.debug("Option 2: extract the needed value for placeholders from value_selection.csv")
-                        next_value_selection = f"{Path(value_selection).parent}/value_selection.csv"
-                        query, injection_cache = ctx.invoke(inject_constant, queryfile=next_queryfile,
-                                                            value_selection=next_value_selection, ignore_errors=False)
-                    except RuntimeError:
-                        solution_option = 3
-                        continue
-
-                # Option 3: Relax the query knowing there is NO solution mapping for given combination of placeholders
-                elif solution_option == 3:
-                    # try:
-                    logger.debug(
-                        "Option 3: Relax the query knowing there is NO solution mapping for given combination of placeholders")
-                    logger.debug("Relaxing query...")
-                    relaxed_query = re.sub(
-                        r"(#)*((\?\w+|\w+:\w+|<\S+>)\s+(\?\w+|a|\w+:\w+|<\S+>)\s+(\w+:\w+|<\S+>)\s*\.)", r"##\2", query)
-
-                    query = write_query(relaxed_query, next_queryfile)
-
-                    next_value_selection = f"{qroot}/{qname}.csv"
-                    ctx.invoke(execute_query, queryfile=next_queryfile, outfile=next_value_selection,
-                               endpoint=endpoint_batch0, dropna=True)
-                    relaxed_query, injection_cache = ctx.invoke(inject_constant, queryfile=next_queryfile,
-                                                                value_selection=next_value_selection,
-                                                                ignore_errors=False)
-                    logger.debug("Restoring query...")
-                    query = re.sub(r"(##)((\?\w+|\w+:\w+|<\S+>)\s+(\?\w+|a|\w+:\w+|<\S+>)\s+(\w+:\w+|<\S+>)\s*\.)",
-                                   r"\2", relaxed_query)
-                # except:
-                #   raise RuntimeError("Cannot instancitate this workload. Either (1) Delete workload_value_selection.csv and retry. (2) Rewrite bounded tps into hard FILTER")
-
-            # Remove from set injected consts
-            query = re.sub(r"(SELECT|CONSTRUCT|DESCRIBE)(\s+DISTINCT)?\s+(.*)\s+WHERE",
-                           rf"\1\2 {' '.join([c for c in consts if c[1:] not in injection_cache.keys()])}\nWHERE",
-                           query)
-            query = re.sub(r"(regex|REGEX)\s*\(\s*(\?\w+)\s*,", r"\1(lcase(str(\2)),", query)
-            logger.debug(next_queryfile)
-            logger.debug(query)
-
-            query = write_query(query, next_queryfile)
-
-            initial_queryfile = next_queryfile
-            consts = __get_uninjected_placeholders(initial_queryfile)
-            itr += 1
-
-        # Restore the original select
-        query = re.sub(r"(SELECT|CONSTRUCT|DESCRIBE)(\s+DISTINCT)?\s+(.*)\s+WHERE",
-                       rf"{original_projection_clause} {original_projection_variables} WHERE", query)
-
-        # Disable explicit join order
-        query = re.sub(r"(DEFINE)", r"##\1", query)
-
-        # Restore FILTER/LIMIT/ORDER...
-        # query = re.sub(r"(#)*(LIMIT|FILTER|ORDER)", r"\2", query)
-        query = re.sub(r"(#)*(FILTER|ORDER)", r"\2", query)
-
-        write_query(query, next_queryfile)
+                    
+    value_selection_values = read_csv(value_selection) 
+    placeholder_chosen_values = value_selection_values.to_dict(orient="records")[instance_id]
+        
+    # Open the original queryfile
+    algebra, options = ctx.invoke(parse_query, queryfile=queryfile)
+    algebra = traverse(algebra, visitPost=lambda node: inject_constant_into_placeholders(node, placeholder_chosen_values))
+    export_query(algebra, options, outfile=outfile, pretty=True)
 
 
 @cli.command()
@@ -812,216 +417,336 @@ def unwrap(provenance, opt_comp, def_comp):
         result_df = result_df.reindex(sorted_columns, axis=1)
         result_df.to_csv(provenance, index=False)
 
+@cli.command()
+@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
+@click.pass_context
+def decompose_query(ctx: click.Context, queryfile, outfile):
+    """Decompose a query into its triple patterns and bgp then export to a file
 
+    Args:
+        ctx (click.Context): click constant to forward to other click commands
+        queryfile (_type_): the initial queryfile
+        outfile (_type_): the final output query
+    """
+
+    def translate(node, children):
+        
+        if isinstance(node, CompValue):
+            if node.name == "pname":
+                return f'{node["prefix"]}:{node["localname"]}'
+        elif hasattr(node, "n3"):
+            return node.n3()
+        
+        return children[0] if isinstance(children, list) and len(children) > 0 else children
+    
+    def visit_add_triple(node, children):
+        if isinstance(node, CompValue):
+            if node.name == "TriplesBlock":
+                for triple in node["triples"]:
+                    s = _traverseAgg(triple[0], translate)
+                    p = _traverseAgg(triple[1], translate)
+                    o = _traverseAgg(triple[2], translate)
+                    children.append([(s, p, o)])
+  
+        return list(chain(*children))
+        
+    composition = {}
+    algebra, _ = ctx.invoke(parse_query, queryfile=queryfile)
+    for triple_id, triple in enumerate(_traverseAgg(algebra, visit_add_triple)):
+        composition[f"tp{triple_id}"] = triple
+        
+    with open(outfile, "w") as out_fs:
+        json.dump(composition, out_fs)
+
+def parse_query_proc(queryfile=None, querydata=None):
+    if queryfile:
+        with open(queryfile, "r") as qf:
+            querydata = qf.read()
+            
+    misc = {
+        "explicit_join_order": False
+    }
+    
+    query = deepcopy(querydata)
+    
+    if re.search(r'DEFINE sql:select-option "order"', query):
+        misc["explicit_join_order"] = True
+        query = query.replace('DEFINE sql:select-option "order"', '')
+    
+    algebra = parseQuery(query)
+    return algebra, misc
+    
+
+@cli.command()
+@click.option("--queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--querydata", type=click.STRING)
+@click.option("--print-algebra", is_flag=True, default=False)
+@click.option("--translate", is_flag=True, default=False)
+def parse_query(queryfile, querydata, print_algebra, translate):
+    """Parse a query string into an algebra object.
+
+    This function takes a query string and parses it into an algebra object. The query string can be provided either through a file or directly as data.
+
+    Args:
+        queryfile (str): The path to the query file to parse. If provided, the function will read the query string from the file.
+        querydata (str): The query string to parse. If `queryfile` is not provided, the function will use this argument as the query string.
+        print_algebra (bool): If True, the parsed algebra object will be printed.
+        translate (bool): If True, the parsed algebra object will be translated.
+
+    Returns:
+        tuple: A tuple containing the parsed algebra object and any additional miscellaneous data.
+
+    Raises:
+        RuntimeError: If both `queryfile` and `querydata` are None, indicating that no query is provided.
+
+    """
+    
+    if queryfile is None and querydata is None:
+        raise RuntimeError("No query to parse...")
+    
+    algebra, misc = parse_query_proc(queryfile=queryfile, querydata=querydata)
+    
+    if print_algebra and translate:
+        pprintAlgebra(translateQuery(algebra))
+    elif print_algebra:
+        pprint(algebra)
+    return algebra, misc
+    
+def export_query(algebra, options, pretty=False, outfile=None):
+    translated = translateQuery(algebra)
+    query = translateAlgebra(translated, pretty=pretty)
+    # Create a temporary file to hold the query
+    with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+        temp_file.write(query)
+    
+    print(query)
+    query = pretty_print_query(temp_file.name)   
+    os.unlink(temp_file.name)
+    
+    if len(query.strip()) == 0:
+        raise RuntimeError("Empty query...")
+        
+    for key, value in options.items():
+        if key == "explicit_join_order" and value:
+            query = f'DEFINE sql:select-option "order"\n{query}'
+            
+    with StringIO(query) as qfs:
+        qlines = [ line for line in qfs.readlines() if line.strip() != "" ]
+        query = "".join(qlines)
+    
+    if outfile:
+        #Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+        with open(outfile, "w") as out_fs:
+            out_fs.write(query)
+    return query
+    
+def read_csv(csv_file):
+    with open(csv_file, "r") as header_fs:
+        header = header_fs.readline().strip().replace('"', '').split(",")
+        tmp = pd.read_csv(csv_file, parse_dates=[h for h in header if "date" in h], low_memory=False)
+        return tmp
+        
 @cli.command()
 @click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.argument("outfile", type=click.Path(dir_okay=False, file_okay=True))
-def build_provenance_query(queryfile, outfile):
-    """Given an input query, this function select the {instance_id}-th row in {value_selection}, 
-    replace each marked variable with a value in that row.
-     
+@click.pass_context
+def build_provenance_query(ctx: click.Context, queryfile, outfile):
+    """
+    Builds a provenance query by wrapping each triple pattern with graph clause
+    
+    1. Wrap each triple pattern with GRAPH clause
+    2. Change projection to include all graph variables + SELECT DISTINCT
+    3. Disable filters
 
     Args:
-        queryfile (path): input query
-        instance_id (integer): instance_id number
-        value_selection (path): the value seletion csv file
-        outfile (_type_): file that holds the result
-        endpoint (_type_): the virtuoso endpoint
+        queryfile (str): The path to the input query file.
+        outfile (str): The path to the output file where the modified query will be written.
 
     Returns:
-        _type_: _description_
+        None
     """
-
-    with open(queryfile, "r") as qfs:
-        query = qfs.read()
-        prefix_full_to_alias, _ = __parse_query_from_file(queryfile)
-        ss_cache = []
-
-        # Wrap each tp with GRAPH clause
-        ntp = 0
-        wherePos = np.inf
-        composition = dict()
-        prefix_alias_to_full = {v: k for k, v in prefix_full_to_alias.items()}
-
-        queryHeader = ""
-        queryBody = ""
-        with StringIO(query) as query_ss:
-            for cur, line in enumerate(query_ss.readlines()):
-                if "WHERE" not in line and cur < wherePos:
-                    if "SELECT" not in line:
-                        queryHeader += line
-                    continue
-
-                # logger.debug("read:", line.strip())
-                subline_search = re.search(
-                    r"^(\s|(\w+\s*\{)|\{)*((\?\w+|\w+:\w+|<\S+>)\s+(\?\w+|a|\w+:\w+|<\S+>)\s+(\?\w+|\w+:\w+|<\S+>))(\s|\}|\.)*\s*$",
-                    line)
-                if subline_search is not None:
-                    subline = subline_search.group(3)
-                    subject = subline_search.group(4)
-                    predicate = subline_search.group(5)
-                    object = subline_search.group(6)
-                    # logger.debug("parsed: ", subject, predicate, object)
-                    # ss_cache.append(subline)
-                    ntp += 1
-                    # predicate_search = re.search(r"(\?\w+|a|(\w+):(\w+)|<\S+>)", predicate)
-                    # predicate_full = predicate_search.group(1)
-                    # prefix, suffix = predicate_search.group(2),  predicate_search.group(3)
-                    # if prefix is not None and suffix is not None:
-                    #     predicate_full = f"{prefix_alias_to_full[prefix]}{suffix}"
-                    composition[f"tp{ntp}"] = [subject, predicate, object]
-                    queryBody += re.sub(re.escape(subline), f"GRAPH ?tp{ntp} {{ {subline} }}", line)
-                else:
-                    queryBody += line
-                    if "WHERE" in line:
-                        wherePos = cur
-
-        # Wrap tpi with STR(...) as ... because there is a bug where Virtuoso v7.5.2 yield duplicata with empty OPTIONAL columns
-        # Reproduce bug:
-        #   - Take two query instances of the same template: A: (q02 instance 8) and B: (q02 instance 5)
-        #   - Execute A, wait for completion, then execute B, watt for completion
-        #   - There should be duplicated results for query B 
-        graph_proj = ' '.join([f"(STR(?tp{i}) AS ?tp{i})" for i in np.arange(1, ntp + 1)])
-
-        query = queryHeader + queryBody
-        query = re.sub(r"(SELECT|CONSTRUCT|DESCRIBE)(\s+DISTINCT)?\s+(.*)\s+WHERE",
-                       f"SELECT DISTINCT {graph_proj} WHERE", query)
-        # Disable filters
-        query = re.sub(r"(#)*(LIMIT|OFFSET|ORDER)", r"##\2", query)
-
-        write_query(query, outfile)
-
-        with open(f"{outfile}.comp", mode="w") as composition_fs:
-            json.dump(composition, composition_fs)
-
-
+    
+    algebra, options = ctx.invoke(parse_query, queryfile=queryfile)
+    algebra = traverse(algebra, visitPost=add_graph_to_triple_pattern)
+    algebra = traverse(algebra, visitPost=replace_select_projection_with_graph)
+    algebra = traverse(algebra, visitPost=disable_orderby_limit)
+    export_query(algebra, options, outfile=outfile, pretty=True)
+        
 @cli.command()
-@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("source-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("outfile", type=click.Path(dir_okay=False, file_okay=True))
-@click.option("use-service", is_flag=True, default=False)
-def build_optimized_query(queryfile, source_selection, outfile, use_service):
-    """Given an injected query and an source selection file, detect exclusive groups and optmize query
-     
-
-    Args:
-        queryfile (path): input query
-        instance_id (integer): instance_id number
-        value_selection (path): the value seletion csv file
-        outfile (_type_): file that holds the result
-        endpoint (_type_): the virtuoso endpoint
-
-    Returns:
-        _type_: _description_
-    """
-
-    keyword = "SERVICE" if use_service else "GRAPH"
-
-    source_selection_df = pd.read_csv(source_selection)
-    exclusive_groups_tps = None
-    exclusive_groups = []
-    for row_id in range(len(source_selection_df)):
-        tmp = pd.Series(source_selection_df.loc[row_id, :]) \
-            .to_frame("source") \
-            .reset_index() \
-            .groupby("source", dropna=False) \
-            .aggregate(list) \
-            .sort_values("index").reset_index()
-        tmp["bgp"] = tmp.index.map(lambda x: f"bgp{x}")
-
-        if exclusive_groups_tps is None:
-            exclusive_groups_tps = tmp
-
-        elif not exclusive_groups_tps["index"].equals(tmp["index"]):
-            msg = f"This source selection produce more than one type of exclusive group, which is not supported at this time"
-            logger.warn(msg)
-            raise RuntimeError(msg)
-
-        exclusive_groups.append(exclusive_groups_tps)
-
-    exclusive_groups_df = pd.concat(exclusive_groups, ignore_index=True) \
-        .groupby("bgp").aggregate(
-        {"source": lambda x: frozenset(pd.Series(x).dropna().sort_values()), "index": "first"}) \
-        .groupby("source").aggregate(list)
-    print(exclusive_groups_df)
-
-    for source_candidates, tps in exclusive_groups_df.iterrows():
-        bgp = np.array(tps.to_list()).flatten().tolist()
-        print(source_candidates, bgp)
-
-    with open(queryfile, "r") as qfs:
-        query = qfs.read()
-        prefix_full_to_alias, _ = __parse_query_from_file(queryfile)
-        ss_cache = []
-
-        # Wrap each tp with GRAPH clause
-        ntp = 0
-        bgp_id = 0
-        wherePos = np.inf
-        composition = dict()
-        prefix_alias_to_full = {v: k for k, v in prefix_full_to_alias.items()}
-
-        queryHeader = ""
-        queryBody = ""
-        with StringIO(query) as query_ss:
-            for cur, line in enumerate(query_ss.readlines()):
-                if "WHERE" not in line and cur < wherePos:
-                    if "SELECT" not in line:
-                        queryHeader += line
-                    continue
-
-                # if cur > wherePos:
-                #   queryBody += f"{keyword} ?bgp{bgp_id} " + "{"
-
-                # logger.debug("read:", line.strip())
-                subline_search = re.search(
-                    r"^(\s|(\w+\s*\{)|\{)*((\?\w+|\w+:\w+|<\S+>)\s+(\?\w+|a|\w+:\w+|<\S+>)\s+(\?\w+|\w+:\w+|<\S+>))(\s|\}|\.)*\s*$",
-                    line)
-                if subline_search is not None:
-                    subline = subline_search.group(3)
-                    subject = subline_search.group(4)
-                    predicate = subline_search.group(5)
-                    object = subline_search.group(6)
-                    # logger.debug("parsed: ", subject, predicate, object)
-                    # ss_cache.append(subline)
-                    ntp += 1
-                    # predicate_search = re.search(r"(\?\w+|a|(\w+):(\w+)|<\S+>)", predicate)
-                    # predicate_full = predicate_search.group(1)
-                    # prefix, suffix = predicate_search.group(2),  predicate_search.group(3)
-                    # if prefix is not None and suffix is not None:
-                    #     predicate_full = f"{prefix_alias_to_full[prefix]}{suffix}"
-                    composition[f"tp{ntp}"] = [subject, predicate, object]
-                    queryBody += re.sub(re.escape(subline), f"{keyword} ?tp{ntp} {{ {subline} }}", line)
-                else:
-                    queryBody += line
-                    if "WHERE" in line:
-                        wherePos = cur
-
-        # Wrap tpi with STR(...) as ... because there is a bug where Virtuoso v7.5.2 yield duplicata with empty OPTIONAL columns
-        # Reproduce bug:
-        #   - Take two query instances of the same template: A: (q02 instance 8) and B: (q02 instance 5)
-        #   - Execute A, wait for completion, then execute B, watt for completion
-        #   - There should be duplicated results for query B 
-        graph_proj = ' '.join([f"(STR(?tp{i}) AS ?tp{i})" for i in np.arange(1, ntp + 1)])
-
-        query = queryHeader + queryBody
-        query = re.sub(r"(SELECT|CONSTRUCT|DESCRIBE)(\s+DISTINCT)?\s+(.*)\s+WHERE",
-                       f"SELECT DISTINCT {graph_proj} WHERE", query)
-        # Disable filters
-        query = re.sub(r"(#)*(LIMIT|OFFSET|ORDER)", r"##\2", query)
-
-        write_query(query, outfile)
-
-        with open(f"{outfile}.comp", mode="w") as composition_fs:
-            json.dump(composition, composition_fs)
-
-
-@cli.command()
-@click.argument("queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("value-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("constfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("subqueryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.argument("workload-value-selection", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("n-instances", type=click.INT)
-def create_workload_value_selection(queryfile, value_selection, workload_value_selection, n_instances):
+@click.pass_context
+def create_workload_value_selection(ctx: click.Context, configfile, constfile, subqueryfile, workload_value_selection, n_instances):
+    """Create a value selection file from a query file
+
+    Args:
+        queryfile (str): Path to the query file.
+        value_selection (str): Path to the value selection file.
+        n_instances (int): Number of instances to create in the value selection file.
+        constfile (str): Path to the constfile.
+        seed (int): Random seed for reproducibility.
+        workload_value_selection (str): Path to the output workload value selection file.
+    """
+    
+    # Read config
+    config = load_config(configfile)
+    # batch0_graph = config["generation"]["virtuoso"]["batch_members"][0]
+    # batch0_endpoint = None
+    # proxy_mapping_file = config["generation"]["virtuoso"]["proxy_mapping"]
+    # with open(proxy_mapping_file, "r") as pmfs:
+    #     proxy_mapping = json.load(pmfs)
+    #     batch0_endpoint = proxy_mapping[batch0_graph]
+    
+    batch0_endpoint = config["generation"]["virtuoso"]["endpoint_batch0"]
+                      
+    # Get subqueries
+    subqueries = {}
+    with open(subqueryfile, "r") as sqfs:
+        subqueries = json.load(sqfs)
+
+    for subq_id, subq_info in subqueries.items():
+        subq_kind = subq_info["kind"]
+        subq_text = subq_info["query"]
+        
+        subq_value_selection_file = f"{Path(subqueryfile).parent}/{Path(subqueryfile).stem}.{subq_id}.csv"
+        
+        if not os.path.exists(subq_value_selection_file):
+            ctx.invoke(
+                execute_query, 
+                querydata = subq_text,
+                outfile=subq_value_selection_file, 
+                endpoint=batch0_endpoint
+            )
+        subqueries[subq_id]["subq_value_selection_file"] = subq_value_selection_file
+            
+        if subq_kind == "exclusive":
+            ctx.invoke(
+                create_workload_value_selection_with_exclusive,
+                configfile=configfile,
+                querydata=subq_text,
+                value_selection=subq_value_selection_file,
+                n_instances=n_instances,
+                workload_value_selection=workload_value_selection,
+                constfile=constfile
+            )
+            return
+    
+    # Update subqueries file
+    with open(subqueryfile, "w") as sqfs:
+        json.dump(subqueries, sqfs)
+    
+    # Create workload value selection
+    ctx.invoke(
+        create_workload_value_selection_with_constraints, 
+        subquery_file=subqueryfile, 
+        n_instances=n_instances, 
+        workload_value_selection=workload_value_selection,
+        constfile=constfile
+    )
+
+@click.command()
+@click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("value-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("n-instances", type=click.INT)
+@click.option("--queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--querydata", type=click.STRING)
+@click.option("--workload-value-selection", type=click.Path(exists=False, file_okay=True, dir_okay=False))
+@click.option("--constfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--seed", type=click.INT, default=PANDAS_RANDOM_STATE)
+@click.pass_context
+def create_workload_value_selection_with_exclusive(ctx: click.Context, configfile, value_selection, n_instances, queryfile, querydata, workload_value_selection, constfile, seed):
+            
+    # Read config
+    config = load_config(configfile)
+    # batch0_graph = config["generation"]["virtuoso"]["batch_members"][0]
+    # batch0_endpoint = None
+    # proxy_mapping_file = config["generation"]["virtuoso"]["proxy_mapping"]
+    # with open(proxy_mapping_file, "r") as pmfs:
+    #     proxy_mapping = json.load(pmfs)
+    #     batch0_endpoint = proxy_mapping[batch0_graph]
+    
+    batch0_endpoint = config["generation"]["virtuoso"]["endpoint_batch0"]
+    
+    # Composition
+    comp = {}
+    with open(constfile, "r") as cfs:
+        comp = json.load(cfs)
+    
+    # Obtain the rest of the placeholders using VALUES
+    workload_subq_value_selection = (
+        read_csv(value_selection)
+        .sample(n_instances, random_state=seed)
+        .reset_index(drop=True)
+    )
+        
+    subq_algebra, _ = ctx.invoke(parse_query, queryfile=queryfile, querydata=querydata)
+    subq_variables = set(map(str, _traverseAgg(subq_algebra, collect_variables)))
+    
+    cond_queries = [ q.get("query") for q in comp.values() if len(q) > 0 and q.get("query") ]
+    consts = set(comp.keys())
+    if len(cond_queries) > 0:
+        cond_query_str = " and ".join(cond_queries)
+        query_algebra = parse_expr(cond_query_str)
+        consts.update(_traverseAgg(query_algebra, collect_constants))
+    consts = consts & subq_variables
+    
+    filter_consts = deepcopy(consts)
+    for const, info in comp.items():
+        if info.get("ignoreFilter") == True:
+            if const in filter_consts:
+                filter_consts.remove(const)
+    
+    tmp_dfs = []
+    for instance_id in tqdm(range(n_instances)):
+        tmp_query_algebra, options = ctx.invoke(parse_query, queryfile=queryfile, querydata=querydata)  
+        inline_data = workload_subq_value_selection.iloc[instance_id]
+        if isinstance(inline_data, pd.Series):
+            inline_data = inline_data.to_frame().T
+        inline_data = inline_data.to_dict(orient="list")
+        query_consts = set(map(str, _traverseAgg(tmp_query_algebra, collect_variables)))
+        tmp_query_algebra = traverse(tmp_query_algebra, visitPost=lambda node: add_values_with_placeholders(node, inline_data))
+        tmp_query_algebra = traverse(tmp_query_algebra, visitPost=lambda node: remove_filter_with_placeholders(node, consts={"query": query_consts,"select": consts, "filter": filter_consts}))
+        tmp_query_algebra = traverse(tmp_query_algebra, disable_orderby_limit)
+        tmp_query_str = export_query(tmp_query_algebra, options, pretty=True)
+        
+        # if not os.path.exists(tmp_query_result_file):              
+        tmp_query_result = ctx.invoke(
+            execute_query, 
+            querydata=tmp_query_str, 
+            endpoint=batch0_endpoint, 
+        )
+        
+        print(tmp_query_str)
+        
+        
+        tmp_df: pd.DataFrame = ctx.invoke(
+            create_workload_value_selection_with_constraints, 
+            value_selection_data=tmp_query_result, 
+            n_instances=1, 
+            seed=PANDAS_RANDOM_STATE+instance_id,
+            constfile=constfile
+        )
+        
+        tmp_dfs.append(tmp_df)
+        
+    workload_subq_value_selection = pd.concat(tmp_dfs, ignore_index=True)
+    workload_subq_value_selection.to_csv(workload_value_selection, index=False)
+    return workload_subq_value_selection
+                            
+@cli.command()
+@click.option("--value-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--value-selection-data", type=click.STRING)
+@click.option("--n-instances", type=click.INT)
+@click.option("--subquery-file", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--workload-value-selection", type=click.Path(exists=False, file_okay=True, dir_okay=False))
+@click.option("--constfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--seed", type=click.INT, default=PANDAS_RANDOM_STATE)
+@click.pass_context
+def create_workload_value_selection_with_constraints(ctx: click.Context, value_selection, value_selection_data, n_instances, subquery_file, workload_value_selection, constfile, seed):
     """Sample {n_instances} rows amongst the value selection. 
     The sampling is guaranteed to return results for provenance queries, using statistical criteria:
         1. Percentiles for numerical attribute: if value falls between 25-75 percentile
@@ -1033,24 +758,55 @@ def create_workload_value_selection(queryfile, value_selection, workload_value_s
         workload_value_selection (_type_): _description_
         n_instances (_type_): _description_
     """
-
-    header_fs = open(value_selection, "r")
-    header = header_fs.readline().strip().replace('"', '').split(",")
-    header_fs.close()
-    value_selection_values = pd.read_csv(value_selection, parse_dates=[h for h in header if "date" in h],
-                                         low_memory=False)
-
+    
+    with open(constfile, "r") as cfs:
+        comp = json.load(cfs)
+        
+    subqueries = {}
+    
+    if subquery_file:
+        with open(subquery_file, "r") as sqfs:
+            subqueries = json.load(sqfs)
+    
+    subquery_results = []
+    if value_selection_data is not None:
+        subquery_results.append(value_selection_data)
+    
+    if value_selection is None: 
+        subquery_result_files = [ sq_info["subq_value_selection_file"] for sq_info in subqueries.values() if "subq_value_selection_file" in sq_info ]
+             
+        join_cols = set()        
+        for subquery_result_file in subquery_result_files:
+            tmp = read_csv(subquery_result_file)
+            subquery_results.append(tmp)
+            
+            if len(join_cols) == 0:
+                join_cols = set(tmp.columns)
+            else:
+                join_cols = join_cols & set(tmp.columns)
+        
+        logger.debug(f"Join columns: {join_cols}")
+    else:
+        subquery_results.append(read_csv(value_selection))
+          
+    # Join all subquery results  
+    df = subquery_results.pop(0)
+    while len(subquery_results) > 0:
+        tmp = subquery_results.pop(0)
+        logger.debug(f"Left join with {df.columns}")
+        logger.debug(f"Right join with {tmp.columns}")
+        df = pd.merge(df, tmp, how="inner", on=list(join_cols))
+    
+    # Filter out numerical values that are not in the 10-90 percentile    
     numerical_cols = []
-    for col in value_selection_values.columns:
-        values = value_selection_values[col].dropna()
+    for col in df.columns:
+        values = df[col].dropna()
         if not values.empty:
             dtype = values.dtype
             if np.issubdtype(dtype, np.number) or np.issubdtype(dtype, np.datetime64):
                 numerical_cols.append(col)
-
-    numerical = value_selection_values[numerical_cols]
-    workload = value_selection_values
-
+    
+    numerical = df[numerical_cols]
     if not numerical.empty:
         query = " or ".join([
             f"( `{col}` >= {repr(numerical[col].quantile(0.10))} and `{col}` <= {repr(numerical[col].quantile(0.90))} )"
@@ -1058,44 +814,100 @@ def create_workload_value_selection(queryfile, value_selection, workload_value_s
             for col in numerical.columns
         ])
 
-        workload = value_selection_values.query(query)
-
-    _, parse_result = __parse_query_from_file(queryfile)
-    filter_query_clauses = []
-
-    for const, resource in parse_result.items():
-
-        if const == "@skip": continue
-
-        # Replace all tokens in subDict
-        isOpUnary = (resource["type"] is None or resource.get("src") is None)
-        left = right = const[1:] if isOpUnary else resource.get("src")[1:]
-        if not isOpUnary:
-            left = const[1:]
-            right = resource.get("src")[1:]
-
-        # Replace for FILTER clauses
-        if resource["type"] is not None:
-
-            if left not in workload.columns:
-                continue
-
-            # Implement more operators here
-            op = resource["op"]
-            if ">" in op:
-                filter_query_clauses.append(f"`{left}` {op} `{right}`")
-            elif "<" in op:
-                filter_query_clauses.append(f"`{left}` {op} `{right}`")
-            elif op in ["!=", "$!"]:
-                for extra in resource.get("extras"):
-                    r_extra = extra[1:]
-                    filter_query_clauses.append(f"`{left}` != `{r_extra}`")
-
-    filter_query = " and ".join(filter_query_clauses)
-    logger.debug(filter_query)
-    result = workload.query(filter_query) if len(filter_query) > 0 else workload
-    result.sample(n_instances).to_csv(workload_value_selection, index=False)
-
+        df = df.query(query)   
+    
+    def has_only_placeholder(node, children):
+        if isinstance(node, CompValue):
+            if node.name == "Placeholder":
+                return True
+            return False
+        return all(children)
+    
+    def remove_placeholder_nodes(node, non_placeholder_queries, non_placeholder_names, df):
+        if isinstance(node, CompValue):
+            if node.name == "ComparisonCondition":
+                left, op, right = node["left"]["column_name"], node["op"]["op"], node["right"]["column_name"]
+                logger.debug(f"Inspecting: left={repr(left)}, op={repr(op)}, right={repr(right)}")
+                if left not in df.columns:
+                    non_placeholder_queries.append(node)
+                    non_placeholder_names.add(right)
+                    return CompValue("Placeholder")
+                if right not in df.columns:
+                    non_placeholder_queries.append(node)
+                    non_placeholder_names.add(right)
+                    return CompValue("Placeholder")
+            if node.name == "BinaryExpr":
+                left, op, right = node["left"], node["op"], node["right"]
+                if left.name == "Placeholder" and right.name == "Placeholder":
+                    return CompValue("Placeholder")
+                elif left.name == "Placeholder":
+                    return right
+                elif right.name == "Placeholder":
+                    return left
+            elif node.name == "UnaryExpr":
+                op, right = node["op"], node["right"]
+                if right.name == "Placeholder":
+                    return CompValue("Placeholder")
+                
+    def create_placeholder_value(row, placeholder_query):
+        
+        left, op, right = placeholder_query["left"]["column_name"], placeholder_query["op"]["op"], placeholder_query["right"]["column_name"]
+        
+        # Left is the placeholder, select random value in df[right]
+        # x < p1
+        if left not in df.columns:
+            logger.debug(f"Row: {row}")
+            subq = f"{right} {op} {repr(row[right])}" 
+            logger.debug(f"subq: {subq}")
+            candidates = df.query(subq)[right]
+            if candidates.empty:
+                raise ValueError(f"Query {subq} returns no result!")
+            row[left] = candidates.sample(1, random_state=seed).item()
+        
+        # Right is the placeholder, select random value in df[left]
+        elif right not in df.columns:
+            subq = f"{left} {op} {repr(row[left])}" 
+            candidates = df.query(subq)[left]
+            if candidates.empty:
+                raise ValueError(f"Query {subq} returns no result!")
+            row[right] = candidates.sample(1, random_state=seed).item()
+                
+        return row
+                    
+    non_placeholder_queries = []
+    non_placeholder_names = set()
+    
+    cond_queries = [ q.get("query") for q in comp.values() if len(q) > 0 and q.get("query") ]
+    if len(cond_queries) > 0:
+        query = " and ".join(cond_queries)
+        logger.debug(f"Query to transform: {query}")
+        algebra = parse_expr(query)
+        algebra = traverse(
+            algebra, 
+            visitPost=lambda node: remove_placeholder_nodes(
+                node, non_placeholder_queries, non_placeholder_names, df
+            )
+        )
+        
+        if not _traverseAgg(algebra, has_only_placeholder):
+            logger.debug("Filtering on placeholder columns...")
+            query = translate_query(algebra)    
+            df = df.query(query)
+    
+    # Sample n_instances
+    result = df.sample(n_instances)
+    
+    # Get a value for the placeholder
+    for placeholder_query in non_placeholder_queries:
+        logger.debug(f"Placeholder query: {placeholder_query}")
+        result = result.apply(lambda row: create_placeholder_value(row, placeholder_query), axis=1) 
+    
+    # Remove placeholder columns
+    result.drop(columns=non_placeholder_names, axis=1, inplace=True)
+    if workload_value_selection:
+        result.to_csv(workload_value_selection, index=False)
+    return result
+       
 
 if __name__ == "__main__":
     cli()

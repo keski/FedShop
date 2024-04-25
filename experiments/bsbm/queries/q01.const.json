@@ -1,0 +1,8 @@
+{
+    "ProductType": {},
+    "ProductFeature1": {},
+    "ProductFeature2": {},
+    "constValue1": {
+        "query": "`constValue1` < `value1`"
+    }
+}

@@ -135,14 +135,7 @@ def create_stats(statsfile, failed_reason=None):
         with open(statsfile, "w") as fs:
             # Write the header
             fs.write(f"{','.join(result.keys())}\n")
-            fs.write(f"{','.join(result.values())}\n")
-    
-def __exec_virtuoso_command(cmd, compose_file, service_name, batch_id):
-    container_name = get_docker_containers(compose_file, service_name)[batch_id]
-    os.system(f"docker exec {container_name} /opt/virtuoso-opensource/bin/isql \"EXEC={cmd};\"")
-    
-def virtuoso_kill_all_transactions(compose_file, service_name, batch_id):
-    __exec_virtuoso_command("txn_killall(6)", compose_file, service_name, batch_id)
+            fs.write(f"{','.join(result.values())}\n")    
     
 def kill_process(proc_pid):
     try:

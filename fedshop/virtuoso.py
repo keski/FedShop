@@ -29,7 +29,7 @@ def cli():
     pass
 
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.option("--exec", type=click.STRING)
 @click.option("--return_output", is_flag=True, default=False)
@@ -40,12 +40,13 @@ def isql_exec(container_name, isql, exec, return_output):
     if container_name:
         cmd = f'docker exec {container_name} {isql} "EXEC={exec}"'
     
+    #click.echo (f"Executing command: {cmd}")
     proc = subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE)
     if return_output:
         return proc.stdout.decode("utf-8")
 
 @cli.command
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.option("--graph-uri", type=click.STRING, help="The URI of the graph.")
 @click.pass_context
@@ -65,7 +66,7 @@ def retrieve_sparql_host(ctx: click.Context, container_name, isql, graph_uri):
         sql = f"SELECT SH_HOST, SH_GRAPH_URI FROM DB.DBA.SYS_SPARQL_HOST WHERE SH_GRAPH_URI = '{graph_uri}';"
 
     output = ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=sql, return_output=True)
-    output = re.search(r".*(SH_HOST[\W\w\s]*)\d+ Rows\.", output).group(1)
+    output = re.search(r".*(SH_HOST[\W\w\s]*\s+)(\d+) Rows\.", output).group(1)
 
     mapping = {}
     with StringIO(output) as f:
@@ -83,7 +84,7 @@ def retrieve_sparql_host(ctx: click.Context, container_name, isql, graph_uri):
     return mapping
 
 @cli.command
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.option("--graph-uri", type=click.STRING, help="The URI of the graph.")
 @click.pass_context
@@ -97,7 +98,7 @@ def retrieve_sparql_endpoints(ctx: click.Context, container_name, isql, graph_ur
         str: The host of the graph.
     """
 
-    host_filter = "true"
+    host_filter = "1"
     if graph_uri:
         mapping = ctx.invoke(retrieve_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri)
         host = mapping[graph_uri]
@@ -109,7 +110,7 @@ def retrieve_sparql_endpoints(ctx: click.Context, container_name, isql, graph_ur
     sql = f"SELECT HP_HOST, HP_LISTEN_HOST FROM DB.DBA.HTTP_PATH WHERE HP_PPATH = '/!sparql/' AND {host_filter};"
     
     output = ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=sql, return_output=True)
-    output = re.search(r".*(HP_HOST[\W\w\s]*)\d+ Rows\.", output).group(1)
+    output = re.search(r".*(HP_HOST[\W\w\s]*\s+)(\d+) Rows\.", output).group(1)
 
     records = []
     with StringIO(output) as f:
@@ -117,6 +118,7 @@ def retrieve_sparql_endpoints(ctx: click.Context, container_name, isql, graph_ur
         for line in lines:
             line = line.strip()
             if line.startswith(("HP_HOST", "VARCHAR", "_")) or len(line) == 0:
+                print(line)
                 continue
             
             hp_host, hp_listen_host = re.split(r"\s+", line)
@@ -127,12 +129,13 @@ def retrieve_sparql_endpoints(ctx: click.Context, container_name, isql, graph_ur
     return df
 
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.argument("graph-uri", type=click.STRING)
 @click.argument("host", type=click.STRING)
+@click.option("--on-duplicate", type=click.Choice(["IGNORE", "REPLACE"]))
 @click.pass_context
-def update_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host):
+def update_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host, on_duplicate):
     """Update the SPARQL host for the given graph URI.
 
     Args:
@@ -140,12 +143,16 @@ def update_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host
         host (str): The host of the graph.
     """
     click.echo(f"Updating SPARQL host for graph {graph_uri} to {host}.")
+    
+    insert_mode = "INTO"
+    if on_duplicate:
+        insert_mode = "REPLACING" if on_duplicate == "REPLACE" else "SOFT"
 
-    exec = f"INSERT INTO DB.DBA.SYS_SPARQL_HOST (SH_HOST, SH_GRAPH_URI) VALUES (\'{host}\', \'{graph_uri}\');"
+    exec = f"INSERT {insert_mode} DB.DBA.SYS_SPARQL_HOST (SH_HOST, SH_GRAPH_URI) VALUES (\'{host}\', \'{graph_uri}\');"
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
 
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.option("--graph-uri", type=click.STRING)
 @click.option("--host", type=click.STRING)
@@ -173,7 +180,7 @@ def remove_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
 
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.argument("vhost", type=click.STRING)
 @click.argument("lhost", type=click.STRING)
@@ -184,25 +191,27 @@ def remove_sparql_endpoint(ctx: click.Context, container_name, isql, vhost, lhos
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
     
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.argument("host", type=click.STRING)
 @click.argument("graph-uri", type=click.STRING)
+@click.option("--lpath", type=click.STRING, default="/sparql")
+@click.option("--on-duplicate", type=click.Choice(["IGNORE", "REPLACE"]))
 @click.pass_context
-def create_sparql_endpoint(ctx: click.Context, container_name, isql, host, graph_uri):
+def create_sparql_endpoint(ctx: click.Context, container_name, isql, host, graph_uri, lpath, on_duplicate):
     vhost, vport = host.split(":")
     lhost = f":{vport}"
 
-    ctx.invoke(remove_sparql_endpoint, container_name=container_name, isql=isql, vhost=vhost, lhost=lhost, lpath="/sparql")
+    ctx.invoke(remove_sparql_endpoint, container_name=container_name, isql=isql, vhost=vhost, lhost=lhost, lpath=lpath)
     
-    exec = f"DB.DBA.VHOST_DEFINE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'/sparql\', ppath=>\'/!sparql/\', is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
+    exec = f"DB.DBA.VHOST_DEFINE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
 
-    ctx.invoke(remove_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=host)
-    ctx.invoke(update_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=host)
+    #ctx.invoke(remove_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=host)
+    ctx.invoke(update_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=host, on_duplicate=on_duplicate)
 
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.option("--drop-first", is_flag=True, default=False)
 @click.argument("graph-uri", type=click.STRING)
@@ -234,7 +243,7 @@ def create_graph_group(ctx: click.Context, container_name, isql, drop_first, gra
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
 
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.argument("graph-uri", type=click.STRING)
 @click.pass_context
@@ -244,7 +253,7 @@ def drop_graph_group(ctx: click.Context, container_name, isql, graph_uri):
 
 @cli.command()
 @click.argument("action", type=click.Choice(["INS", "DEL", "GET"]))
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql") 
 @click.option("--graph-group", type=click.STRING)
 @click.option("--member-iri", type=click.STRING)
@@ -266,11 +275,12 @@ def update_graph_group(ctx: click.Context, action, container_name, isql, graph_g
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
 
 @cli.command()
-@click.option("--container_name", type=click.STRING)
+@click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
 @click.option("--datapath", type=click.STRING, default="/usr/share/proj/")
+@click.option("--datafiles", type=click.STRING, default="*.nq")
 @click.pass_context
-def ingest_data(ctx: click.Context, container_name, isql, datapath):
+def ingest_data(ctx: click.Context, container_name, isql, datapath, datafiles):
     """
     Ingests data into the Virtuoso RDF store.
 
@@ -283,16 +293,27 @@ def ingest_data(ctx: click.Context, container_name, isql, datapath):
     Returns:
         None
     """
+    datafiles = [ datafile.strip() for datafile in datafiles.split(",") ]
+    
     # Grant permissions to the SPARQL user
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec='grant select on \\\"DB.DBA.SPARQL_SINV_2\\\" to \\\"SPARQL\\\";')
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec='grant execute on \\\"DB.DBA.SPARQL_SINV_IMP\\\" to \\\"SPARQL\\\";')
 
     # Load the data
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=f"ld_dir('{datapath}', '*.nq', 'http://example.com/datasets/default');")    
+    for datafile in tqdm(datafiles):
+        ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=f"ld_dir('{datapath}', '{datafile}', 'http://example.com/datasets/default');")    
     
     # Launch the ingest process and checkpoint
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=f"rdf_loader_run(log_enable=>2);")
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=f"checkpoint;")
 
+@cli.command()
+@click.option("--container-name", type=click.STRING)
+@click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
+@click.pass_context
+def virtuoso_kill_all_transactions(ctx: click.Context, container_name, isql):
+    click.echo("Killing all transactions in Virtuoso.")
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec="txn_killall(6)")
+    
 if __name__ == "__main__":
     cli()

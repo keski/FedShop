@@ -1,0 +1,12 @@
+services:
+  raw-jena:
+    image: minhhoangdang/raw-jena:main
+    user: root
+    container_name: "docker-raw-jena-1"
+    # network_mode: "host"
+    ports:
+      - "3330:3330"
+      - "5173:5173"
+    volumes:
+      - "../../../engines/fedup/summaries/fedshop/batch0/fedup-id:/database"
+    # entrypoint: ["/bin/sh", "-c", "java -cp ./ -jar raw-jena-module-0.0.2.jar --ui /home/raw/raw-jena-ui "] 

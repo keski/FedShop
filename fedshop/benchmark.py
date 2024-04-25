@@ -23,8 +23,9 @@ def cli():
 @click.option("--touch", is_flag=True, default=False)
 @click.option("--no-cache", is_flag=True, default=False)
 @click.option("--dry-run", is_flag=True, default=False)
+@click.option("--force", is_flag=True, default=False)
 @click.pass_context
-def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch, no_cache, dry_run):
+def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch, no_cache, dry_run, force):
     """Ingest the data
 
     Args:
@@ -40,11 +41,16 @@ def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch
     CONFIG = load_config(configfile)["generation"]
     WORK_DIR = CONFIG["workdir"]
 
-    INGESTION_SNAKEFILE = f"{WORK_DIR}/snakefile/ingest-data.smk"
+    INGESTION_SNAKEFILE = f"snakemake/ingest-data.smk"
     WORKFLOW_DIR = f"{WORK_DIR}/rulegraph"
     os.makedirs(name=WORKFLOW_DIR, exist_ok=True)
+    
+    SNAKEMAKE_OPTS = ""
+    
+    if force:
+        SNAKEMAKE_OPTS += " -F"
 
-    SNAKEMAKE_OPTS = f"-p --cores {cores} --config configfile={configfile}"
+    SNAKEMAKE_OPTS += f" -p --cores {cores} --config configfile={configfile}"
     if rerun_incomplete: SNAKEMAKE_OPTS += " --rerun-incomplete"
     if dry_run: SNAKEMAKE_OPTS += " --dry-run"
     
@@ -65,6 +71,7 @@ def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch
 @cli.command()
 @click.argument("category", type=click.Choice(["data", "queries"]))
 @click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.option("--config", type=click.STRING, default=None, help='Params for snakemake file. Example: --config="engine=costfed attempt=0 query=q04 instance=7 batch=0"')
 @click.option("--debug", is_flag=True, default=False)
 @click.option("--clean", type=click.STRING, help="[all, model, benchmark] + db + [metrics|metrics_batchk]")
 @click.option("--cores", type=click.INT, default=1, help="The number of cores used allocated. -1 if use all cores.")
@@ -72,8 +79,9 @@ def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch
 @click.option("--touch", is_flag=True, default=False)
 @click.option("--no-cache", is_flag=True, default=False)
 @click.option("--dry-run", is_flag=True, default=False)
+@click.option("--force", is_flag=True, default=False)
 @click.pass_context
-def generate(ctx: click.Context, category, configfile, debug, clean, cores, rerun_incomplete, touch, no_cache, dry_run):
+def generate(ctx: click.Context, category, configfile, config, debug, clean, cores, rerun_incomplete, touch, no_cache, dry_run, force):
     """Run the benchmark
 
     Args:
@@ -86,10 +94,11 @@ def generate(ctx: click.Context, category, configfile, debug, clean, cores, reru
 
     if cores == -1: cores = "all"
 
-    CONFIG = load_config(configfile)["generation"]
-    WORK_DIR = CONFIG["workdir"]
-
-    N_BATCH=CONFIG["n_batch"]
+    CONFIG = load_config(configfile)
+    CONFIG_GEN = CONFIG["generation"]
+    CONFIG_EVAL = CONFIG["evaluation"]
+    WORK_DIR = CONFIG_GEN["workdir"]
+    N_BATCH=CONFIG_GEN["n_batch"]
 
     GENERATION_SNAKEFILE= (
         f"{WORK_DIR}/snakefile/generate-data.smk" 
@@ -99,8 +108,48 @@ def generate(ctx: click.Context, category, configfile, debug, clean, cores, reru
 
     WORKFLOW_DIR = f"{WORK_DIR}/rulegraph"
     os.makedirs(name=WORKFLOW_DIR, exist_ok=True)
+    
+    QUERY_DIR = f"{WORK_DIR}/queries"
+    
+    config_dict = {
+        "configfile": [configfile]
+    }
+    
+    if config is not None:
+        config = config.strip()
+        SNAKEMAKE_CONFIG_MATCHER = re.match(r"(\w+\=\w+(,\w+)*(\s+)?)+", config)
+        if SNAKEMAKE_CONFIG_MATCHER is None:
+            raise RuntimeError(f"Syntax error: config option should be 'name1=value1 name2=value2'")
+        
+        for c in config.split():
+            k, v = c.split("=")
 
-    SNAKEMAKE_OPTS = f"-p --cores {cores} --config configfile={configfile}"
+            if k in ["debug", "explain"]:
+                v = eval(v)
+
+            config_dict[k] = v.split(",")
+
+        if "batch" not in config_dict.keys():
+            config_dict["batch"] = list(map(str, range(N_BATCH)))
+
+        if "query" not in config_dict.keys():
+            config_dict["query"] = [Path(os.path.join(QUERY_DIR, f)).resolve().stem for f in os.listdir(QUERY_DIR) if f.endswith(".sparql")]
+
+        if "instance" not in config_dict.keys():
+            config_dict["instance"] = list(map(str, range(CONFIG_GEN["n_query_instances"])))
+            
+        if "attempt" not in config_dict.keys():
+            config_dict["attempt"] = list(map(str, range(CONFIG_EVAL["n_attempts"])))
+    
+    SNAKEMAKE_CONFIGS = " ".join([f"{k}={','.join(v)}" for k, v in config_dict.items()])
+    
+    SNAKEMAKE_OPTS = ""
+    
+    if force:
+        SNAKEMAKE_OPTS += " -F"
+        
+
+    SNAKEMAKE_OPTS += f" -p --cores {cores} --config {SNAKEMAKE_CONFIGS}"
     if rerun_incomplete: SNAKEMAKE_OPTS += " --rerun-incomplete"
     if dry_run: SNAKEMAKE_OPTS += " --dry-run"
     
@@ -157,25 +206,28 @@ def load_model(modelfile, experiment_dir, clean):
 @click.option("--touch", is_flag=True, default=False)
 @click.option("--no-cache", is_flag=True, default=False)
 @click.option("--noexec", is_flag=True, default=False)
+@click.option("--dry-run", is_flag=True, default=False)
+@click.option("--force", is_flag=True, default=False)
 @click.pass_context
-def evaluate(ctx: click.Context, configfile, config, debug, clean, cores, rerun_incomplete, touch, no_cache, noexec):
+def evaluate(ctx: click.Context, configfile, config, debug, clean, cores, rerun_incomplete, touch, no_cache, noexec, dry_run, force):
 
     CONFIG = load_config(configfile)
-    GEN_CONFIG = CONFIG["generation"]
-    WORK_DIR = GEN_CONFIG["workdir"]
+    CONFIG_GEN = CONFIG["generation"]
+    WORK_DIR = CONFIG_GEN["workdir"]
     BENCH_DIR = f"{WORK_DIR}/benchmark/evaluation"
 
     EVALUATION_SNAKEFILE=f"snakemake/evaluate.smk"
-    SNAKEMAKE_CONFIGS = f"configfile={configfile} "
     SINGLE_QUERY_MODE = False
     SNAKEMAKE_CONFIG_MATCHER = None
 
-    N_BATCH = GEN_CONFIG["n_batch"]
+    N_BATCH = CONFIG_GEN["n_batch"]
 
     CONFIG_EVAL = CONFIG["evaluation"]
     QUERY_DIR = f"{WORK_DIR}/queries"
 
-    config_dict = {}
+    config_dict = {
+        "configfile": [configfile],
+    }
     
     if config is not None:
         config = config.strip()
@@ -192,28 +244,30 @@ def evaluate(ctx: click.Context, configfile, config, debug, clean, cores, rerun_
             config_dict[k] = v.split(",")
 
         if "batch" not in config_dict.keys():
-            config_dict["batch"] = list(range(N_BATCH))
-
-        if "engine" not in config_dict.keys():
-            config_dict["batch"] = CONFIG_EVAL["engines"]
+            config_dict["batch"] = list(map(str, range(N_BATCH)))
 
         if "query" not in config_dict.keys():
             config_dict["query"] = [Path(os.path.join(QUERY_DIR, f)).resolve().stem for f in os.listdir(QUERY_DIR) if f.endswith(".sparql")]
 
         if "instance" not in config_dict.keys():
-            config_dict["instance"] = list(range(GEN_CONFIG["n_query_instances"]))
+            config_dict["instance"] = list(map(str, range(CONFIG_GEN["n_query_instances"])))
             
         if "attempt" not in config_dict.keys():
-            config_dict["attempt"] = list(range(CONFIG_EVAL["n_attempts"]))
+            config_dict["attempt"] = list(map(str, range(CONFIG_EVAL["n_attempts"])))
     
-        SNAKEMAKE_CONFIGS += config
+        SNAKEMAKE_CONFIGS = " ".join([f"{k}={','.join(v)}" for k, v in config_dict.items()])
         SINGLE_QUERY_MODE = eval(config_dict["debug"]) if config_dict.get("debug") is not None else False
     
     WORKFLOW_DIR = f"{WORK_DIR}/rulegraph"
     os.makedirs(name=WORKFLOW_DIR, exist_ok=True)
+    
+    SNAKEMAKE_OPTS = ""
+
+    if force:
+        SNAKEMAKE_OPTS += " -F"
 
     if cores == -1: cores = "all"
-    SNAKEMAKE_OPTS = f"-p --cores {cores} --config {SNAKEMAKE_CONFIGS}"
+    SNAKEMAKE_OPTS += f" -p --cores {cores} --config {SNAKEMAKE_CONFIGS}"
     if rerun_incomplete: SNAKEMAKE_OPTS += " --rerun-incomplete"
     
     if no_cache:
@@ -223,6 +277,9 @@ def evaluate(ctx: click.Context, configfile, config, debug, clean, cores, rerun_
         logger.info("Marking files as completed...")
         shutil.rmtree(".snakemake", ignore_errors=True)
         SNAKEMAKE_OPTS += " --touch"
+        
+    if dry_run:
+        SNAKEMAKE_OPTS += " --dry-run"
 
     # if in evaluate mode
     if clean is not None :
@@ -358,9 +415,6 @@ def setup(configfile):
     proxy_endpoint = proxy_config["endpoint"]
     proxy_compose_file = proxy_config["compose_file"]
     proxy_service_name = proxy_config["service_name"]
-
-    cmd = f"docker-compose -f {proxy_compose_file} up -d {proxy_service_name}"
-    if os.system(cmd) != 0 : exit(1)
 
     try:
         while requests.get(proxy_endpoint).status_code != 200:

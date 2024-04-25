@@ -11,11 +11,17 @@ services:
       VIRT_SPARQL_ResultSetMaxRows: 0
       VIRT_SPARQL_MaxQueryExecutionTime: 0
       # Uncomment next two lines if there is 8 GB system memory free
-      VIRT_Parameters_NumberOfBuffers: 680000
-      VIRT_Parameters_MaxDirtyBuffers: 500000
+      # VIRT_Parameters_NumberOfBuffers: 680000
+      # VIRT_Parameters_MaxDirtyBuffers: 500000
       # Uncomment next two lines if there is 16 GB system memory free
       # VIRT_Parameters_NumberOfBuffers: 1360000
       # VIRT_Parameters_MaxDirtyBuffers: 1000000
+
+      # Uncomment next two lines if there is 32 GB system memory free
+      VIRT_Parameters_NumberOfBuffers: 2720000
+      VIRT_Parameters_MaxDirtyBuffers: 2000000
+      
+      VIRT_Parameters_MaxQueryMem: 4G # 2G by default
       VIRT_Parameters_MaxClientConnections: 20
       VIRT_Parameters_IndexTreeMaps: 256
       VIRT_Parameters_CheckpointInterval: 0
@@ -32,3 +38,41 @@ services:
     # ports:
     #   - 1111:1111
     #   - 8890:8890
+  bsbm-virtuoso-batch0:
+    image: openlink/virtuoso-opensource-7:7.2.12-alpine
+    container_name: docker-bsbm-virtuoso-batch0
+    environment:
+      SPARQL_UPDATE: "false"
+      DBA_PASSWORD: "dba"
+      VIRT_HTTPServer_ServerThreads: 20
+      VIRT_HTTPServer_MaxClientConnections: 20
+      VIRT_SPARQL_MaxQueryCostEstimationTime: 0
+      VIRT_SPARQL_ResultSetMaxRows: 0
+      VIRT_SPARQL_MaxQueryExecutionTime: 0
+      # Uncomment next two lines if there is 8 GB system memory free
+      # VIRT_Parameters_NumberOfBuffers: 680000
+      # VIRT_Parameters_MaxDirtyBuffers: 500000
+      # Uncomment next two lines if there is 16 GB system memory free
+      # VIRT_Parameters_NumberOfBuffers: 1360000
+      # VIRT_Parameters_MaxDirtyBuffers: 1000000
+
+      # Uncomment next two lines if there is 32 GB system memory free
+      VIRT_Parameters_NumberOfBuffers: 2720000
+      VIRT_Parameters_MaxDirtyBuffers: 2000000
+      
+      VIRT_Parameters_MaxQueryMem: 4G # 2G by default
+      VIRT_Parameters_MaxClientConnections: 20
+      VIRT_Parameters_IndexTreeMaps: 256
+      VIRT_Parameters_CheckpointInterval: 0
+      VIRT_Parameters_DefaultIsolation: 1
+      VIRT_Parameters_ThreadCleanupInterval: 1
+      VIRT_Parameters_ResourcesCleanupInterval: 1
+      # VIRT_Plugins_Load1: "plain, geos"
+      # VIRT_Plugins_Load2: "plain, proj4"
+      # VIRT_Plugins_Load3: "plain, shapefileio"
+      # VIRT_Plugins_Load4: "plain, graphql"
+    volumes:
+      - "../model/dataset:/usr/share/proj"
+    ports:
+      - 1112:1111
+      - 8891:8890

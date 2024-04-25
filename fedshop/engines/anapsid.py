@@ -61,11 +61,10 @@ def prerequisites(ctx: click.Context, eval_config):
 @click.option("--out-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--query-plan", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--stats", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
-@click.option("--force-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="")
 @click.option("--batch-id", type=click.INT, default=-1)
 @click.option("--noexec", is_flag=True, default=False)
 @click.pass_context
-def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, force_source_selection, batch_id, noexec):
+def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec):
     """Execute the workload instance then its associated source selection query.
     
     Expected output:
@@ -82,7 +81,6 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
         out_source_selection (_type_): _description_
         query_plan (_type_): _description_
         stats (_type_): _description_
-        force_source_selection (_type_): _description_
         batch_id (_type_): _description_
     """
     
@@ -271,7 +269,7 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
 
     raw_source_selection = pd.read_csv(tmp_outfile, sep=",")[["triples", "sources"]]
     
-    tp_composition = f"{Path(prefix_cache).parent}/provenance.sparql.comp"
+    tp_composition = f"{Path(prefix_cache).parent}/composition.json"
     with    open(tp_composition, "r") as comp_fs,\
             open(prefix_cache, "r") as prefix_cache_fs \
     :

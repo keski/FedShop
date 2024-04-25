@@ -1,0 +1,6 @@
+{
+    "ProductXYZ": {},
+    "currentDate": {
+        "query": "`currentDate` < `date`"
+    }
+}

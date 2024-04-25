@@ -195,7 +195,7 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
     
     raw_source_selection = pd.read_csv(infile, sep=";")[["triples", "sources"]]
     
-    tp_composition = f"{Path(prefix_cache).parent}/provenance.sparql.comp"
+    tp_composition = f"{Path(prefix_cache).parent}/composition.json"
     with    open(tp_composition, "r") as comp_fs,\
             open(prefix_cache, "r") as prefix_cache_fs \
     :

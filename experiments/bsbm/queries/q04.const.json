@@ -1,0 +1,16 @@
+{
+    "ProductType": {},
+    "ProductFeature1": {},
+    "ProductFeature2": {
+        "query": "`ProductFeature2` != `ProductFeature1`"
+    },
+    "x": {
+        "query": "`x` <= `p1`"
+    },
+    "ProductFeature3": {
+        "query": "`ProductFeature3` != `ProductFeature2` and `ProductFeature3` != `ProductFeature1`"
+    },
+    "y": {
+        "query": "`y` <= `p2`"
+    }
+}

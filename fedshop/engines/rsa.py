@@ -18,8 +18,10 @@ import requests
 from tqdm import tqdm
 sys.path.append(str(os.path.join(Path(__file__).parent.parent)))
 
+from algebra.rdflib_algebra import add_service_to_triple_blocks, add_values_with_placeholders
 from utils import load_config, fedshop_logger, create_stats
-from query import write_query, exec_query_on_endpoint
+from query import export_query, exec_query_on_endpoint, parse_query_proc
+from rdflib.plugins.sparql.algebra import traverse
 
 logger = fedshop_logger(Path(__file__).name)
 
@@ -125,50 +127,23 @@ def create_service_query_manually(ctx: click.Context, eval_config, query, query_
     source_selection_df = pd.read_csv(opt_source_selection_file)
     
     eval_config = load_config(eval_config)
-    
-    internal_endpoint_prefix=str(eval_config["evaluation"]["engines"]["rsa"]["internal_endpoint_prefix"])
-    proxy_server = eval_config["evaluation"]["proxy"]["endpoint"]
-    port = re.search(r":(\d+)", proxy_server).group(1)
-    
-    internal_endpoint_prefix=internal_endpoint_prefix.replace("localhost", "host.docker.internal")
-    internal_endpoint_prefix=internal_endpoint_prefix.replace("8890", port, 1)
+    proxy_mapping_file = eval_config["generation"]["virtuoso"]["proxy_mapping"]
+    proxy_mapping = {}
+    with open(proxy_mapping_file, "r") as proxy_mapping_fs:
+        proxy_mapping = json.load(proxy_mapping_fs)
     
     source_selection_combinations = source_selection_df \
-        .applymap(lambda x: URIRef(f"{internal_endpoint_prefix}{x}").n3()) \
+        .applymap(lambda x: URIRef(proxy_mapping[x]).n3()) \
         .apply(lambda x: f"( {' '.join(x)} )", axis=1) \
         .to_list()
         
-    values_clause_vars = [ f"?{col}" for col in source_selection_df.columns ]   
-    values_clause = f"    VALUES ( {' '.join(values_clause_vars)} ) {{ {' '.join(source_selection_combinations)} }}\n"
+    query_algebra, query_options = parse_query_proc(queryfile=query)
     
-    opt_source_selection_query_file = f"{Path(query).parent}/provenance.sparql.opt"
-    service_query_file = f"{Path(query_plan).parent}/service.sparql"
-    if query_plan == "/dev/null":
-        service_query_file = "/tmp/service.sparql"
-    Path(service_query_file).touch()
+    inline_data = dict(zip(source_selection_df.columns, source_selection_combinations)) 
+    query_algebra = traverse(query_algebra, visitPost=lambda node: add_values_with_placeholders(node, inline_data))
+    query_algebra = traverse(query_algebra, visitPost=lambda node: add_service_to_triple_blocks(node, inline_data))
     
-    with    open(opt_source_selection_query_file, "r") as opt_source_selection_qfs, \
-            open(query, "r") as query_fs:
-
-        # Create SERVICE query
-        query_text = query_fs.read()
-        select_clause = re.search(r"(SELECT(.*)[\S\s]+WHERE)", query_text).group(1)
-        
-        lines = opt_source_selection_qfs.readlines()
-        insert_idx = [ line_idx for line_idx, line in enumerate(lines) if "WHERE" in line ][0]
-        lines.insert(insert_idx+1, values_clause)
-                
-        out_query_text = "".join(lines)
-        out_query_text = re.sub(r"SELECT(.*)[\S\s]+WHERE", select_clause, out_query_text)
-        out_query_text = re.sub(r"(regex|REGEX)\s*\(\s*(\?\w+)\s*,", r"\1(lcase(str(\2)),", out_query_text)
-        out_query_text = re.sub(r"(#)*(FILTER\s*\(\!bound)", r"\2", out_query_text)
-        out_query_text = re.sub(r"#*(DEFINE|OFFSET)", r"##\1", out_query_text)
-        out_query_text = re.sub(r"#*(ORDER|LIMIT)", r"\1", out_query_text)
-        out_query_text = re.sub("GRAPH", "SERVICE", out_query_text)
-                        
-        # Write service query
-        out_query_text = write_query(out_query_text, service_query_file)
-        return out_query_text
+    export_query(query_algebra, query_options, pretty=True, outfile=query_plan)
     
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
@@ -191,7 +166,10 @@ def create_service_query(ctx: click.Context, eval_config, query, query_plan, for
     """
     conf = load_config(eval_config)
     fedup_dir = conf["evaluation"]["engines"]["rsa"]["fedup_dir"]
-    remote = conf["generation"]["virtuoso"]
+    proxy_mapping_file = conf["generation"]["virtuoso"]["proxy_mapping"]
+    proxy_mapping_file = os.path.realpath(proxy_mapping_file)
+    proxy_host = conf["evaluation"]["proxy"]["host"]
+    proxy_port = conf["evaluation"]["proxy"]["port"]
         
     query = os.path.realpath(query)
     query_plan = os.path.realpath(query_plan)
@@ -200,13 +178,16 @@ def create_service_query(ctx: click.Context, eval_config, query, query_plan, for
     federation_file = os.path.realpath(f"{fedup_dir}/config/fedshop/endpoints_batch{batch_id}.txt")
     
     Path(federation_file).parent.mkdir(parents=True, exist_ok=True)
-    with open(federation_file, "w") as f:
-        for i in range((batch_id+1)*10):
-            f.write(f"http://www.vendor{i}.fr/\n")
-            f.write(f"http://www.ratingsite{i}.fr/\n")
+    with open(federation_file, "w") as f, open(proxy_mapping_file, "r") as proxy_mapping_fs:
+        proxy_mapping = json.load(proxy_mapping_fs)
+        federation_members = conf["generation"]["virtuoso"]["federation_members"]
+        for federation_member_iri in federation_members[f"batch{batch_id}"].values():
+            #f.write(f"{proxy_mapping[federation_member_iri]}\n") # TODO Use this line for other engines
+            f.write(f"{federation_member_iri}\n")
     
     os.chdir(fedup_dir)
-    cmd = f'mvn exec:java -Dmain.class="fr.gdd.fedup.utils.QuerySourceSelectionExplain" -Dexec.args="--query={query} --summary={summary_file} --output={query_plan} --federation={federation_file} --format=union --remote={remote}"'
+    # -Dhttp.proxyHost={proxy_host} -Dhttp.proxyPort={proxy_port} 
+    cmd = f'mvn exec:java -Dmain.class="fr.gdd.fedup.utils.QuerySourceSelectionExplain" -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -Dhttps.proxyHost="{proxy_host}" -Dhttps.proxyPort="{proxy_port}" -Dexec.args="--query={query} --summary={summary_file} --output={query_plan} --federation={federation_file} --format=union --mapping={proxy_mapping_file}"'
     logger.debug(f"{cmd}")
     os.system(cmd)
     

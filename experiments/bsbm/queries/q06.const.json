@@ -1,0 +1,5 @@
+{
+    "word1": {
+        "query": "`word1` in `label`"
+    }
+}

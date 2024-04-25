@@ -19,7 +19,8 @@ WHERE {
         ?offer bsbm:price ?price .
         ?offer bsbm:vendor ?vendor .
         ?vendor rdfs:label ?vendorTitle .
-        ?vendor bsbm:country <http://downlode.org/rdf/iso-3166/countries#FR> .
+        # const ?country
+        ?vendor bsbm:country <http://downlode.org/rdf/iso-3166/countries#US> .
         ?offer bsbm:validTo ?date .
 
         # const ?currentDate < ?date 

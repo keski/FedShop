@@ -1,7 +1,9 @@
 services:
   fedshop-proxy:
     image: minhhoangdang/fedshop-proxy:latest
-    ports:
-      - 5555:8080
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # ports:
+    #   - 5555:8080
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    network_mode: host
+    entrypoint: ["sh", "-c", "java -jar -Dserver.port=5555 -Dserver.host=0.0.0.0 /fedshop-proxy/FedShop-proxy-1.0-SNAPSHOT.jar"]

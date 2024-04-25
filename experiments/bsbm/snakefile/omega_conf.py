@@ -1,3 +1,4 @@
+from itertools import product
 from omegaconf import OmegaConf
 import ast
 from io import BytesIO
@@ -234,11 +235,62 @@ def get_product_producers(nbProducts):
 def normal_truncated(mu, sigma, lower, upper):
     return int(truncnorm.rvs((lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma))
 
-def get_batch_endpoints(n_batch, proxy_endpoint):
-    return [proxy_endpoint + f"services/batch{i}/sparql" for i in range(n_batch)]
+def get_batch_members(n_batch):
+    return [
+        f"http://www.batch{batch_id}.fr/" for batch_id in range(n_batch)
+    ]
 
-def get_federation_endpoints(n_vendor, n_ratingsite, proxy_endpoint):
-    return [proxy_endpoint + f"services/vendor{i}/sparql" for i in range(n_vendor)] + [proxy_endpoint + f"ratingsite{i}/sparql" for i in range(n_ratingsite)]
+def get_federation_members(n_batch, n_vendor, n_ratingsite):
+    """List federation members' endpoints for batch processing.
+
+    Args:
+        n_batch (int): The number of batches.
+        n_vendor (int): The number of vendors.
+        n_ratingsite (int): The number of rating sites.
+        proxy_endpoint (str): The base URL of the proxy endpoint.
+
+    Returns:
+        OmegaConf: A dictionary 
+        { 
+            batch'batch_id': { member_name: graph_iri } 
+        }
+
+    """
+    
+    # Assign corresponding graphs to each group
+    _, vendor_edges = np.histogram(np.arange(n_vendor), n_batch)
+    vendor_edges = vendor_edges[1:].astype(int) + 1
+
+    _, ratingsite_edges = np.histogram(np.arange(n_ratingsite), n_batch)
+    ratingsite_edges = ratingsite_edges[1:].astype(int) + 1
+    
+    result = OmegaConf.create()
+    for batch_id in range(n_batch):
+        result[f"batch{batch_id}"] = OmegaConf.create()
+        
+        for vendor_id in range(vendor_edges[batch_id]):
+            member_name = f"vendor{vendor_id}"
+            member_iri = f"http://www.vendor{vendor_id}.fr/"
+            result[f"batch{batch_id}"][member_name] = member_iri
+            
+        for ratingsite_id in range(ratingsite_edges[batch_id]):
+            member_name = f"ratingsite{ratingsite_id}"
+            member_iri = f"http://www.ratingsite{ratingsite_id}.fr/"
+            result[f"batch{batch_id}"][member_name] = member_iri
+
+    return result
+
+def get_data_files(workdir, n_vendor, n_ratingsite):
+    """Get the data directory path.
+
+    Args:
+        workdir (str): The working directory path.
+
+    Returns:
+        str: The data directory path.
+    """
+    
+    return [ f"vendor{vendor_id}.nq" for vendor_id in range(n_vendor) ] + [ f"ratingsite{ratingsite_id}.nq" for ratingsite_id in range(n_ratingsite) ]
     
 # Register new resolvers
 OmegaConf.register_new_resolver("multiply", lambda *args: np.prod(args).item())
@@ -255,8 +307,9 @@ OmegaConf.register_new_resolver("normal_dist", lambda *args: NormalDistGenerator
 OmegaConf.register_new_resolver("normal_dist_range", lambda *args: NormalDistRangeGenerator(*args).getValue())
 OmegaConf.register_new_resolver("normal_truncated", normal_truncated)
 
-OmegaConf.register_new_resolver("get_batch_endpoints", get_batch_endpoints)
-OmegaConf.register_new_resolver("get_federation_endpoints", get_federation_endpoints)
+OmegaConf.register_new_resolver("get_batch_members", get_batch_members)
+OmegaConf.register_new_resolver("get_federation_members", get_federation_members)
+OmegaConf.register_new_resolver("get_data_files", get_data_files)
 
 def load_config(filename, saveAs=None):
     """Load configuration from a file. By default, attributes are interpolated at access time.

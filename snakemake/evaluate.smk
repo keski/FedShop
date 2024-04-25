@@ -12,10 +12,9 @@ from textops import cat, find_first_pattern
 
 import sys
 smk_directory = os.path.abspath(workflow.basedir)
-sys.path.append(os.path.join(Path(smk_directory).parent.parent, "fedshop"))
+sys.path.append(os.path.join(Path(smk_directory).parent, "fedshop"))
 
-from utils import ping, fedshop_logger, load_config, get_docker_endpoint_by_container_name, get_docker_containers, check_container_status, create_stats, virtuoso_kill_all_transactions, wait_for_container
-from utils import activate_one_container as utils_activate_one_container
+from utils import ping, fedshop_logger, load_config, create_stats
 
 #===============================
 # EVALUATION PHASE:
@@ -24,15 +23,30 @@ from utils import activate_one_container as utils_activate_one_container
 # - Generate metrics and stats for each engine
 #===============================
 
+print(config)
+
 CONFIGFILE = config["configfile"]
 WORK_DIR = "experiments/bsbm"
 CONFIG = load_config(CONFIGFILE)
+
+USE_DOCKER = CONFIG["use_docker"]
 
 CONFIG_GEN = CONFIG["generation"]
 CONFIG_EVAL = CONFIG["evaluation"]
 
 SPARQL_COMPOSE_FILE = CONFIG_GEN["virtuoso"]["compose_file"]
 SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
+
+VIRTUOSO_COMPOSE_CONFIG = load_config(SPARQL_COMPOSE_FILE)
+SPARQL_CONTAINER_NAME = VIRTUOSO_COMPOSE_CONFIG["services"][SPARQL_SERVICE_NAME]["container_name"]
+
+# Modify the path to the Virtuoso ISQL executable and the path to the data
+VIRTUOSO_PATH_TO_ISQL = CONFIG_GEN["virtuoso"]["isql"]
+VIRTUOSO_PATH_TO_DATA = CONFIG_GEN["virtuoso"]["data_dir"]
+
+if USE_DOCKER:
+    VIRTUOSO_PATH_TO_ISQL = "/opt/virtuoso-opensource/bin/isql"
+    VIRTUOSO_PATH_TO_DATA = "/usr/share/proj/" 
 
 PROXY_COMPOSE_FILE =  CONFIG_EVAL["proxy"]["compose_file"]
 PROXY_SERVICE_NAME = CONFIG_EVAL["proxy"]["service_name"]
@@ -56,6 +70,7 @@ MODEL_DIR = f"{WORK_DIR}/model"
 BENCH_DIR = f"{WORK_DIR}/benchmark/evaluation"
 TEMPLATE_DIR = f"{MODEL_DIR}/watdiv"
 
+# Override setttings if specified in the config file
 BATCH_ID = str(config["batch"]).split(",") if config.get("batch") is not None else range(N_BATCH)
 ENGINE_ID = str(config["engine"]).split(",") if config.get("engine") is not None else CONFIG_EVAL["engines"]
 QUERY_PATH = (
@@ -78,49 +93,6 @@ LOGGER = fedshop_logger(Path(__file__).name)
 # USEFUL FUNCTIONS
 #=================
 
-def activate_one_container(batch_id):
-    """ Activate one container while stopping all others
-    """
-
-    is_virtuoso_restarted = False
-    VIRTUOSO_MANUAL_ENDPOINT = CONFIG_GEN["virtuoso"]["manual_port"]
-    if VIRTUOSO_MANUAL_ENDPOINT != -1:
-        if ping(f"http://localhost:{VIRTUOSO_MANUAL_ENDPOINT}/sparql") != 200:
-            raise RuntimeError(f"Virtuoso endpoint {VIRTUOSO_MANUAL_ENDPOINT} is not available!")
-
-    else:
-        LOGGER.info("Activating Virtuoso docker container...")
-        is_virtuoso_restarted = utils_activate_one_container(batch_id, SPARQL_COMPOSE_FILE, SPARQL_SERVICE_NAME, LOGGER, f"{BENCH_DIR}/virtuoso-ok.txt")
-
-    LOGGER.info("Activating proxy docker container...")
-    proxy_target = CONFIG_GEN["virtuoso"]["endpoints"][batch_id]
-    proxy_target = proxy_target.replace("/sparql", "/")
-    if ping(PROXY_SPARQL_ENDPOINT) == -1:
-        LOGGER.info("Starting proxy server...")
-        shell(f"docker-compose -f {PROXY_COMPOSE_FILE} up -d {PROXY_SERVICE_NAME}")
-    
-    while ping(PROXY_SPARQL_ENDPOINT) != 200:
-        os.system(f'curl -X GET {PROXY_SERVER + "set-destination"}?proxyTo={proxy_target}')
-        time.sleep(1)
-        #wait_for_container(PROXY_SPARQL_ENDPOINT, "/dev/null", logger , wait=1)
-
-    if is_virtuoso_restarted:
-        shell(f"python fedshop/engines/rsa.py warmup {CONFIGFILE}")
-
-def generate_federation_declaration(federation_declaration_file, engine, batch_id):
-    sparql_endpoint = PROXY_SPARQL_ENDPOINT
-
-    LOGGER.info(f"Rewriting {engine} configfile as it is updated!")
-    ratingsite_data_files = [ f"{MODEL_DIR}/dataset/ratingsite{i}.nq" for i in range(N_RATINGSITE) ]
-    vendor_data_files = [ f"{MODEL_DIR}/dataset/vendor{i}.nq" for i in range(N_VENDOR) ]
-
-    batch_id = int(batch_id)
-    ratingsiteSliceId = np.histogram(np.arange(N_RATINGSITE), N_BATCH)[1][1:].astype(int)[batch_id]
-    vendorSliceId = np.histogram(np.arange(N_VENDOR), N_BATCH)[1][1:].astype(int)[batch_id]
-    batch_files = ratingsite_data_files[:ratingsiteSliceId+1] + vendor_data_files[:vendorSliceId+1]  
-
-    activate_one_container(LAST_BATCH)
-    shell(f"python fedshop/engines/{engine}.py generate-config-file {' '.join(batch_files)} {federation_declaration_file} {CONFIGFILE} {batch_id} {sparql_endpoint}")
 
 #=================
 # PIPELINE
@@ -224,8 +196,7 @@ rule evaluate_engines:
     retries: 1
     input: 
         query=ancient(expand("{workDir}/benchmark/generation/{{query}}/instance_{{instance_id}}/injected.sparql", workDir=WORK_DIR)),
-        engine_source_selection=ancient(expand("{workDir}/benchmark/generation/{{query}}/instance_{{instance_id}}/batch_{{batch_id}}/provenance.csv", workDir=WORK_DIR)),
-        virtuoso_last_batch=ancient(expand("{workDir}/benchmark/generation/virtuoso_batch{batch_n}-ok.txt", workDir=WORK_DIR, batch_n=N_BATCH-1)),
+        virtuoso_ok=ancient(expand("{workDir}/virtuoso-federation-endpoints-ok.txt", workDir=WORK_DIR)),
         engine_status=ancient("{benchDir}/{engine}/{engine}-ok.txt"),
     output: 
         stats="{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/stats.csv",
@@ -234,16 +205,18 @@ rule evaluate_engines:
     params:
         query_plan="{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/query_plan.txt",
         result_csv="{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/results.csv",
-        engine_config="{benchDir}/{engine}/config/batch_{batch_id}/{engine}.conf",
         last_batch=LAST_BATCH
     run: 
-        activate_one_container(LAST_BATCH)
 
         engine = str(wildcards.engine)
         batch_id = int(wildcards.batch_id)
-        engine_config = f"{WORK_DIR}/benchmark/evaluation/{engine}/config/batch_{batch_id}/{engine}.conf"
-        generate_federation_declaration(engine_config, engine, batch_id)
-        virtuoso_kill_all_transactions(SPARQL_COMPOSE_FILE, SPARQL_SERVICE_NAME, LAST_BATCH)
+        engine_dir = CONFIG_EVAL["engines"][engine]["dir"]
+        shell(f"python fedshop/engines/{engine}.py generate-config-file {CONFIGFILE} {batch_id}")
+        
+        if USE_DOCKER:
+            shell(f"python fedshop/virtuoso.py virtuoso-kill-all-transactions --container-name={SPARQL_CONTAINER_NAME}")
+        else:
+            shell(f"python fedshop/virtuoso.py virtuoso-kill-all-transactions --isql={VIRTUOSO_PATH_TO_ISQL}")
 
         # Early stop if earlier attempts got timed out
         skipBatch = batch_id - 1
@@ -273,19 +246,19 @@ rule evaluate_engines:
         previous_reason = str(skip_stats_file | cat() | find_first_pattern([r"(timeout)"]))
 
         if NO_EXEC:
-            shell("python fedshop/engines/{engine}.py run-benchmark {CONFIGFILE} {params.engine_config} {input.query} --out-result {output.result_txt}  --out-source-selection {output.source_selection} --stats {output.stats} --force-source-selection {input.engine_source_selection} --query-plan {params.query_plan} --batch-id {batch_id} --noexec")
+            shell("python fedshop/engines/{engine}.py run-benchmark {CONFIGFILE} {input.query} --out-result {output.result_txt}  --out-source-selection {output.source_selection} --stats {output.stats} --query-plan {params.query_plan} --batch-id {batch_id} --noexec")
 
         else:
             if canSkip and previous_reason != "":
                 LOGGER.info(skipReason)
-                shell("python fedshop/engines/{engine}.py run-benchmark {CONFIGFILE} {params.engine_config} {input.query} --out-result {output.result_txt}  --out-source-selection {output.source_selection} --stats {output.stats} --force-source-selection {input.engine_source_selection} --query-plan {params.query_plan} --batch-id {batch_id} --noexec")
+                shell("python fedshop/engines/{engine}.py run-benchmark {CONFIGFILE} {input.query} --out-result {output.result_txt}  --out-source-selection {output.source_selection} --stats {output.stats} --query-plan {params.query_plan} --batch-id {batch_id} --noexec")
                 create_stats(str(output.stats), previous_reason)
                 # shell(f"cp {BENCH_DIR}/{wildcards.engine}/{wildcards.query}/instance_{wildcards.instance_id}/batch_{previous_batch}/attempt_{wildcards.attempt_id}/stats.csv {output.stats}")
                 # shell(f"cp {BENCH_DIR}/{wildcards.engine}/{wildcards.query}/instance_{wildcards.instance_id}/batch_{skipBatch}/attempt_{skipAttempt}/query_plan.txt {params.query_plan}")
                 # shell(f"cp {BENCH_DIR}/{wildcards.engine}/{wildcards.query}/instance_{wildcards.instance_id}/batch_{skipBatch}/attempt_{skipAttempt}/source_selection.txt {output.source_selection}")
                 # shell(f"cp {BENCH_DIR}/{wildcards.engine}/{wildcards.query}/instance_{wildcards.instance_id}/batch_{skipBatch}/attempt_{skipAttempt}/results.txt {output.result_txt}")
             else:
-                shell("python fedshop/engines/{engine}.py run-benchmark {CONFIGFILE} {params.engine_config} {input.query} --out-result {output.result_txt}  --out-source-selection {output.source_selection} --stats {output.stats} --force-source-selection {input.engine_source_selection} --query-plan {params.query_plan} --batch-id {batch_id}")
+                shell("python fedshop/engines/{engine}.py run-benchmark {CONFIGFILE} {input.query} --out-result {output.result_txt}  --out-source-selection {output.source_selection} --stats {output.stats} --query-plan {params.query_plan} --batch-id {batch_id}")
 
 
 rule engines_prerequisites:

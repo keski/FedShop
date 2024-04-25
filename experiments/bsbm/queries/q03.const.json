@@ -1,0 +1,13 @@
+{
+    "ProductFeature2": {
+        "exclusive": true
+    },
+    "ProductType": {},
+    "ProductFeature1": {},
+    "x": {
+        "query": "`x` <= `p1`"
+    },
+    "y": {
+        "query": "`y` >= `p3`"
+    } 
+}

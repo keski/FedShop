@@ -1,5 +1,8 @@
+use_docker: true
 generation:
   workdir: "experiments/bsbm"
+  datafiles: "${get_data_files: ${generation.workdir}, ${generation.schema.vendor.params.vendor_n}, ${generation.schema.ratingsite.params.ratingsite_n}}"
+  datafiles_batch0: "${get_data_files: ${generation.workdir}, 10, 10}"
   n_batch: 10
   n_query_instances: 10
   verbose: true
@@ -15,10 +18,20 @@ generation:
   virtuoso:
     compose_file: "${generation.workdir}/docker/virtuoso.yml"
     service_name: "bsbm-virtuoso"
+    isql: "/Applications/Virtuoso Open Source Edition v7.2.app/Contents/virtuoso-opensource/bin/isql" # Skip if use docker
+    data_dir: "${generation.workdir}/model/dataset"
     port: 8890
-    default_endpoint: "http://localhost:${generation.virtuoso.port}/sparql"
-    batch_endpoints: "${get_batch_endpoints: ${generation.n_batch}, ${evaluation.proxy.endpoint}}"
-    federation_endpoints: "${get_federation_endpoints: ${generation.schema.vendor.params.vendor_n}, ${generation.schema.ratingsite.params.ratingsite_n}, ${evaluation.proxy.endpoint}}"
+    proxy_mapping: "${generation.workdir}/virtuoso-proxy-mapping.json"
+    default_url: "http://localhost:${generation.virtuoso.port}"
+    default_endpoint: "${generation.virtuoso.default_url}/sparql"
+    batch_members: "${get_batch_members:${generation.n_batch}}"
+    federation_members: "${get_federation_members:${generation.n_batch}, ${generation.schema.vendor.params.vendor_n}, ${generation.schema.ratingsite.params.ratingsite_n}}"
+    # Batch 0 specific
+    service_name_batch0: "bsbm-virtuoso-batch0"
+    port_batch0: 8891
+    endpoint_batch0: "http://localhost:${generation.virtuoso.port_batch0}/sparql"
+
+
   schema:
     # Configuration for ONE batch
     product:

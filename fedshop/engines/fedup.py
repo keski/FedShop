@@ -77,7 +77,7 @@ def prerequisites(ctx: click.Context, eval_config):
 @click.option("--noexec", is_flag=True, default=False)
 @click.option("--approach", type=click.Choice(["h0", "id", "id-optimal"]), default="h0")
 @click.pass_context
-def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, force_source_selection, batch_id, noexec, approach):
+def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec, approach):
     """Execute the workload instance then its associated source selection query.
     
     Expected output:
@@ -94,7 +94,6 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
         out_source_selection (_type_): _description_
         query_plan (_type_): _description_
         stats (_type_): _description_
-        force_source_selection (_type_): _description_
         batch_id (_type_): _description_
     """
     
@@ -185,7 +184,7 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
             tpAliases = json.loads(str(output["tpAliases"].item()).replace("'", '"').replace("\\n", ""))
 
             prefix_cache = os.path.join("../../", Path(query).parent, "prefix_cache.json")
-            comp = json.load(open(os.path.join(Path(prefix_cache).parent, "provenance.sparql.comp"), "r"))
+            comp = json.load(open(os.path.join(Path(prefix_cache).parent, "composition.json"), "r"))
             prefix2alias = json.load(open(prefix_cache, "r"))
 
             inv_comp = {f"{' '.join(v)}": k for k, v in comp.items()}
