@@ -3,6 +3,7 @@
         "exclusive": true
     },
     "currentDate": {
+        "optional": true,
         "query": "`currentDate` < `date`"
     }
 }

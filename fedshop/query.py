@@ -10,14 +10,13 @@ from collections import Counter
 import os
 from pathlib import Path
 from tqdm import tqdm
-import uuid
 
-from rdflib.term import Variable, Literal, URIRef
+from rdflib.term import Variable
 from rdflib.plugins.sparql.parser import parseQuery
 from rdflib.plugins.sparql.algebra import _traverseAgg, traverse, translateQuery, pprintAlgebra
 from rdflib.plugins.sparql.parserutils import CompValue
 
-from algebra.rdflib_algebra import add_graph_to_triple_pattern, add_values_with_placeholders, collect_variables, disable_orderby_limit, extract_where, inject_constant_into_placeholders, remove_filter_with_placeholders, replace_select_projection_with_graph, translateAlgebra
+from algebra.rdflib_algebra import add_graph_to_triple_pattern, add_values_with_placeholders, collect_triple_variables, collect_variables, disable_offset, disable_orderby_limit, extract_where, inject_constant_into_placeholders, remove_filter_with_placeholders, replace_select_projection_with_graph, translateAlgebra
 from algebra.pandas_algebra import collect_constants, parse_expr, translate_query
 
 import re
@@ -28,7 +27,6 @@ from io import BytesIO, StringIO
 import click
 
 from utils import load_config, fedshop_logger
-
 logger = fedshop_logger(Path(__file__).name)
 
 import nltk
@@ -191,18 +189,6 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
     Returns:
         None
     """   
-                
-    def split_union_query(node, children):
-        if isinstance(node, CompValue):
-            if node.name == "GroupOrUnionGraphPattern":
-                graphs = node["graph"]
-                
-                # Only split when it's UNION clause, i.e., there are at least 2 graphs 
-                if len(graphs) > 1:
-                    for graph in graphs:
-                        children.append([graph])
-        
-        return list(chain(*children))
     
     def has_constant(node, children, consts):
         if isinstance(node, Variable):
@@ -211,7 +197,29 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
             if node.name == "vars":
                 return str(node["var"]) in consts
         return any(children)
+                
+    def split_union_query(node, children):
+        if isinstance(node, CompValue):
+            if node.name == "SelectQuery":
+                where = node["where"]["part"]
+                if len(where) == 1 and where[0].name == "GroupOrUnionGraphPattern":
+                    graphs = where[0]["graph"]
+                    # Only split when it's UNION clause, i.e., there are at least 2 graphs 
+                    if len(graphs) > 1:
+                        for graph in graphs:
+                            children.append([graph])
+        
+        return list(chain(*children))
     
+    def has_optional_first_level(node, children):
+        if isinstance(node, CompValue):
+            if node.name == "SelectQuery":
+                where = node["where"]
+                for subpart in where["part"]:
+                    if subpart.name == "OptionalGraphPattern":
+                        return True
+        return any(children)
+        
     def split_optional_query(node, children, consts):        
         if isinstance(node, CompValue):
             if node.name == "SelectQuery":
@@ -219,31 +227,38 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
                 new_part = []
                 for subpart in where["part"]:
                     if subpart.name == "OptionalGraphPattern":
-                        if traverse(subpart, visitPost=lambda x: has_constant(x, consts)):
-                            new_part.append([subpart["graph"]])
+                        if _traverseAgg(subpart, lambda x, c: has_constant(x, c, consts)):
+                            new_part.extend(subpart["graph"]["part"])
                     else:
-                        new_part.append([subpart])
+                        new_part.append(subpart)
+                
                 new_where = CompValue(
                     "GroupGraphPatternSub", 
-                    part=[new_part]
+                    part=new_part
                 )
                 
                 children.append([new_where])
         
         return list(chain(*children))
     
-    def build_sub_query(node, union_term=None, consts=None):
+    def build_sub_query(node, new_where=None, new_proj=None):
         if isinstance(node, CompValue):
             if node.name in ["SelectQuery", "ConstructQuery", "DescribeQuery", "AskQuery"]:
                 node_args = {
                     "modifier": "DISTINCT"
                 }
-                node_args["where"] = union_term if union_term else node["where"]
+                node_args["where"] = new_where if new_where else node["where"]
                                 
-                if consts:
-                    node_args["projection"] = consts
+                if new_proj:
+                    node_args["projection"] = new_proj
                 
                 return CompValue("SelectQuery", **node_args) 
+                        
+    def collect_filter_variables(node, children):
+        if isinstance(node, CompValue):
+            if node.name == "Filter":
+                children.append(list(map(str, _traverseAgg(node, collect_variables))))
+        return list(chain(*children))
     
     algebra, options = ctx.invoke(parse_query, queryfile=queryfile)    
     subq_bgp_algebras = []
@@ -262,6 +277,7 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
         cond_consts.update(_traverseAgg(cond_algebra, collect_constants))
     
     filter_consts = deepcopy(cond_consts)
+    optional_consts = set()
     
     # Read and build plan
     for const, info in consts_info.items():
@@ -274,7 +290,7 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
                     "exclusive",
                     traverse(
                         algebra, 
-                        lambda node: build_sub_query(node, consts=[
+                        lambda node: build_sub_query(node, new_proj=[
                             CompValue("vars", var=Variable(const))
                         ])
                     )
@@ -284,43 +300,63 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
         if info.get("ignoreFilter") == True:
             if const in filter_consts:
                 filter_consts.remove(const)
-            
-                        
+                
+        if info.get("optional") == True:
+            optional_consts.update(_traverseAgg(parse_expr(info.get("query")), collect_constants))
+
+    filter_consts = filter_consts & set(_traverseAgg(algebra, collect_filter_variables))
+    
+    # Split UNION queries                    
     subq_bgp_algebras.extend([
         ("join", alg) for alg in
         _traverseAgg(algebra, split_union_query)
     ])
     
-    subq_bgp_algebras.extend([
-        ("optional", alg) for alg in
-        _traverseAgg(algebra, split_optional_query, consts=cond_consts)
-    ])
-        
+    # Split optional queries
+    if len(optional_consts) > 0 and _traverseAgg(algebra, has_optional_first_level):
+        subq_bgp_algebras.extend([
+            ("optional", alg) for alg in
+            _traverseAgg(algebra, lambda x, c: split_optional_query(x, c, consts=optional_consts))
+        ])
+    
+    # If there are no subqueries, add a join query with the original query
     if len(subq_bgp_algebras) == 0:
-        subq_bgp_algebras = [("join", _traverseAgg(algebra, extract_where))]
+        subq_bgp_algebras = [("join", _traverseAgg(algebra, extract_where)[0])]
         
     subqueries = {}
     
     # Write the subqueries to files
     for subq_id, (kind, subq_bgp_algebra) in enumerate(subq_bgp_algebras):
-        subq_vars = set(map(str, _traverseAgg(subq_bgp_algebra, collect_variables))) & cond_consts
+        subq_vars = set(map(str, _traverseAgg(subq_bgp_algebra, collect_triple_variables))) & cond_consts
+
         subq_bgp_algebra = traverse(
             subq_bgp_algebra, 
             visitPost=lambda x: remove_filter_with_placeholders(
                 x, consts={"query": subq_vars, "filter": filter_consts}
             )
         )
+                        
         subq_bgp_algebra = traverse(subq_bgp_algebra, visitPost=disable_orderby_limit)
-        
+        subq_bgp_algebra = traverse(subq_bgp_algebra, visitPost=disable_offset)
+                
         if kind == "exclusive":
             subqueries[f"sq{subq_id}"] = {
                 "kind": kind,
                 "query": export_query(subq_bgp_algebra, options, pretty=True)
             }
                             
-        elif kind in ["join", "optional"]:
+        elif kind == "join":
             subq_consts = [ CompValue("vars", var=Variable(c)) for c in subq_vars ]    
-            subq_algebra = traverse(algebra, visitPost=lambda node: build_sub_query(node, subq_bgp_algebra, subq_consts))
+            subq_algebra = traverse(algebra, visitPost=lambda node: build_sub_query(node, new_where=subq_bgp_algebra, new_proj=subq_consts))
+            subqueries[f"sq{subq_id}"] = {
+                "kind": kind,
+                "query": export_query(subq_algebra, options, pretty=True)
+            }
+            
+        elif kind == "optional":
+            subq_vars = subq_vars & optional_consts
+            subq_consts = [ CompValue("vars", var=Variable(c)) for c in subq_vars ]    
+            subq_algebra = traverse(algebra, visitPost=lambda node: build_sub_query(node, new_where=subq_bgp_algebra, new_proj=subq_consts))
             subqueries[f"sq{subq_id}"] = {
                 "kind": kind,
                 "query": export_query(subq_algebra, options, pretty=True)
@@ -360,8 +396,8 @@ def instanciate_workload(ctx: click.Context, queryfile, value_selection, outfile
     # Open the original queryfile
     algebra, options = ctx.invoke(parse_query, queryfile=queryfile)
     algebra = traverse(algebra, visitPost=lambda node: inject_constant_into_placeholders(node, placeholder_chosen_values))
+    algebra = traverse(algebra, visitPost=disable_offset)
     export_query(algebra, options, outfile=outfile, pretty=True)
-
 
 @cli.command()
 @click.argument("provenance", type=click.Path(exists=True, file_okay=True, dir_okay=False))
@@ -516,13 +552,17 @@ def parse_query(queryfile, querydata, print_algebra, translate):
 def export_query(algebra, options, pretty=False, outfile=None):
     translated = translateQuery(algebra)
     query = translateAlgebra(translated, pretty=pretty)
-    # Create a temporary file to hold the query
-    with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
-        temp_file.write(query)
     
-    print(query)
-    query = pretty_print_query(temp_file.name)   
-    os.unlink(temp_file.name)
+    # Remove empty lines
+    with StringIO(query) as qfs:
+        qlines = [ line for line in qfs.readlines() if line.strip() != "" ]
+        query = "".join(qlines)
+        
+    # Create a temporary file to hold the query
+    # with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+    #     temp_file.write(query)   
+    # query = pretty_print_query(temp_file.name) 
+    # os.unlink(temp_file.name)
     
     if len(query.strip()) == 0:
         raise RuntimeError("Empty query...")
@@ -530,10 +570,6 @@ def export_query(algebra, options, pretty=False, outfile=None):
     for key, value in options.items():
         if key == "explicit_join_order" and value:
             query = f'DEFINE sql:select-option "order"\n{query}'
-            
-    with StringIO(query) as qfs:
-        qlines = [ line for line in qfs.readlines() if line.strip() != "" ]
-        query = "".join(qlines)
     
     if outfile:
         #Path(outfile).parent.mkdir(parents=True, exist_ok=True)
@@ -571,6 +607,7 @@ def build_provenance_query(ctx: click.Context, queryfile, outfile):
     algebra = traverse(algebra, visitPost=add_graph_to_triple_pattern)
     algebra = traverse(algebra, visitPost=replace_select_projection_with_graph)
     algebra = traverse(algebra, visitPost=disable_orderby_limit)
+    algebra = traverse(algebra, visitPost=disable_offset)
     export_query(algebra, options, outfile=outfile, pretty=True)
         
 @cli.command()
@@ -602,11 +639,14 @@ def create_workload_value_selection(ctx: click.Context, configfile, constfile, s
     #     batch0_endpoint = proxy_mapping[batch0_graph]
     
     batch0_endpoint = config["generation"]["virtuoso"]["endpoint_batch0"]
-                      
+
     # Get subqueries
     subqueries = {}
     with open(subqueryfile, "r") as sqfs:
         subqueries = json.load(sqfs)
+        
+    b_require_exclusive = False
+    exclusive_sq = None
 
     for subq_id, subq_info in subqueries.items():
         subq_kind = subq_info["kind"]
@@ -615,6 +655,7 @@ def create_workload_value_selection(ctx: click.Context, configfile, constfile, s
         subq_value_selection_file = f"{Path(subqueryfile).parent}/{Path(subqueryfile).stem}.{subq_id}.csv"
         
         if not os.path.exists(subq_value_selection_file):
+            logger.debug(f"Executing subquery:\n {subq_text}")
             ctx.invoke(
                 execute_query, 
                 querydata = subq_text,
@@ -624,33 +665,38 @@ def create_workload_value_selection(ctx: click.Context, configfile, constfile, s
         subqueries[subq_id]["subq_value_selection_file"] = subq_value_selection_file
             
         if subq_kind == "exclusive":
-            ctx.invoke(
-                create_workload_value_selection_with_exclusive,
-                configfile=configfile,
-                querydata=subq_text,
-                value_selection=subq_value_selection_file,
-                n_instances=n_instances,
-                workload_value_selection=workload_value_selection,
-                constfile=constfile
-            )
-            return
-    
+            b_require_exclusive = True
+            exclusive_sq = subq_text
+                
     # Update subqueries file
     with open(subqueryfile, "w") as sqfs:
         json.dump(subqueries, sqfs)
     
     # Create workload value selection
-    ctx.invoke(
-        create_workload_value_selection_with_constraints, 
-        subquery_file=subqueryfile, 
-        n_instances=n_instances, 
-        workload_value_selection=workload_value_selection,
-        constfile=constfile
-    )
+    if b_require_exclusive:
+        ctx.invoke(
+            create_workload_value_selection_with_exclusive,
+            configfile=configfile,
+            querydata=exclusive_sq,
+            excl_value_selection=subq_value_selection_file,
+            subqueries_file=subqueryfile,
+            n_instances=n_instances,
+            workload_value_selection=workload_value_selection,
+            constfile=constfile
+        )
+    else:
+        ctx.invoke(
+            create_workload_value_selection_with_constraints, 
+            subquery_file=subqueryfile, 
+            n_instances=n_instances, 
+            workload_value_selection=workload_value_selection,
+            constfile=constfile
+        )
 
 @click.command()
 @click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
-@click.argument("value-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("excl-value-selection", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument("subqueries-file", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.argument("n-instances", type=click.INT)
 @click.option("--queryfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.option("--querydata", type=click.STRING)
@@ -658,7 +704,7 @@ def create_workload_value_selection(ctx: click.Context, configfile, constfile, s
 @click.option("--constfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.option("--seed", type=click.INT, default=PANDAS_RANDOM_STATE)
 @click.pass_context
-def create_workload_value_selection_with_exclusive(ctx: click.Context, configfile, value_selection, n_instances, queryfile, querydata, workload_value_selection, constfile, seed):
+def create_workload_value_selection_with_exclusive(ctx: click.Context, configfile, excl_value_selection, subqueries_file, n_instances, queryfile, querydata, workload_value_selection, constfile, seed):
             
     # Read config
     config = load_config(configfile)
@@ -678,13 +724,13 @@ def create_workload_value_selection_with_exclusive(ctx: click.Context, configfil
     
     # Obtain the rest of the placeholders using VALUES
     workload_subq_value_selection = (
-        read_csv(value_selection)
+        read_csv(excl_value_selection)
         .sample(n_instances, random_state=seed)
         .reset_index(drop=True)
     )
         
     subq_algebra, _ = ctx.invoke(parse_query, queryfile=queryfile, querydata=querydata)
-    subq_variables = set(map(str, _traverseAgg(subq_algebra, collect_variables)))
+    subq_variables = set(map(str, _traverseAgg(subq_algebra, collect_triple_variables)))
     
     cond_queries = [ q.get("query") for q in comp.values() if len(q) > 0 and q.get("query") ]
     consts = set(comp.keys())
@@ -707,10 +753,11 @@ def create_workload_value_selection_with_exclusive(ctx: click.Context, configfil
         if isinstance(inline_data, pd.Series):
             inline_data = inline_data.to_frame().T
         inline_data = inline_data.to_dict(orient="list")
-        query_consts = set(map(str, _traverseAgg(tmp_query_algebra, collect_variables)))
+        query_consts = set(map(str, _traverseAgg(tmp_query_algebra, collect_triple_variables)))
         tmp_query_algebra = traverse(tmp_query_algebra, visitPost=lambda node: add_values_with_placeholders(node, inline_data))
         tmp_query_algebra = traverse(tmp_query_algebra, visitPost=lambda node: remove_filter_with_placeholders(node, consts={"query": query_consts,"select": consts, "filter": filter_consts}))
         tmp_query_algebra = traverse(tmp_query_algebra, disable_orderby_limit)
+        tmp_query_algebra = traverse(tmp_query_algebra, disable_offset)
         tmp_query_str = export_query(tmp_query_algebra, options, pretty=True)
         
         # if not os.path.exists(tmp_query_result_file):              
@@ -718,10 +765,7 @@ def create_workload_value_selection_with_exclusive(ctx: click.Context, configfil
             execute_query, 
             querydata=tmp_query_str, 
             endpoint=batch0_endpoint, 
-        )
-        
-        print(tmp_query_str)
-        
+        )        
         
         tmp_df: pd.DataFrame = ctx.invoke(
             create_workload_value_selection_with_constraints, 
@@ -774,7 +818,7 @@ def create_workload_value_selection_with_constraints(ctx: click.Context, value_s
     
     if value_selection is None: 
         subquery_result_files = [ sq_info["subq_value_selection_file"] for sq_info in subqueries.values() if "subq_value_selection_file" in sq_info ]
-             
+
         join_cols = set()        
         for subquery_result_file in subquery_result_files:
             tmp = read_csv(subquery_result_file)
@@ -788,7 +832,7 @@ def create_workload_value_selection_with_constraints(ctx: click.Context, value_s
         logger.debug(f"Join columns: {join_cols}")
     else:
         subquery_results.append(read_csv(value_selection))
-          
+
     # Join all subquery results  
     df = subquery_results.pop(0)
     while len(subquery_results) > 0:
@@ -850,14 +894,45 @@ def create_workload_value_selection_with_constraints(ctx: click.Context, value_s
                     return CompValue("Placeholder")
                 
     def create_placeholder_value(row, placeholder_query):
+        """Create a placeholder value for a given row based on the placeholder query.
+    
+        Args:
+            row (dict): The row containing the values.
+            placeholder_query (dict): The placeholder query specifying the left and right column names and the operator.
+
+        Raises:
+            ValueError: If the left column name is not found in the dataframe.
+            ValueError: If the right column name is not found in the dataframe.
+
+        Returns:
+            dict: The updated row with the placeholder value filled.
+        """
         
         left, op, right = placeholder_query["left"]["column_name"], placeholder_query["op"]["op"], placeholder_query["right"]["column_name"]
+        
+        def estimate_replacement_value_based_on_op(op, value):
+            epsilon = None
+            if str(value).isnumeric():
+                epsilon = 1
+            elif isinstance(value, pd.Timestamp):
+                epsilon = pd.Timedelta(days=1)
+            else:
+                raise ValueError(f"Unsupported value type {type(value)} for value {value}!")
+            
+            if op in ["=", "!=", "in"]:
+                return value
+            elif op in [">", ">="]:
+                return value - epsilon
+            elif op in ["<", "<="]:
+                return value + epsilon
+            else:
+                raise ValueError(f"Unsupported operator: {op}")
         
         # Left is the placeholder, select random value in df[right]
         # x < p1
         if left not in df.columns:
             logger.debug(f"Row: {row}")
-            subq = f"{right} {op} {repr(row[right])}" 
+            subq = f"{right} {op} {repr(estimate_replacement_value_based_on_op(op, row[right]))}" 
             logger.debug(f"subq: {subq}")
             candidates = df.query(subq)[right]
             if candidates.empty:
@@ -866,7 +941,7 @@ def create_workload_value_selection_with_constraints(ctx: click.Context, value_s
         
         # Right is the placeholder, select random value in df[left]
         elif right not in df.columns:
-            subq = f"{left} {op} {repr(row[left])}" 
+            subq = f"{left} {op} {repr(estimate_replacement_value_based_on_op(op, row[left]))}" 
             candidates = df.query(subq)[left]
             if candidates.empty:
                 raise ValueError(f"Query {subq} returns no result!")
@@ -894,6 +969,9 @@ def create_workload_value_selection_with_constraints(ctx: click.Context, value_s
             query = translate_query(algebra)    
             df = df.query(query)
     
+    if df.empty:
+        raise ValueError("No results after filtering...")
+    
     # Sample n_instances
     result = df.sample(n_instances)
     
@@ -907,7 +985,7 @@ def create_workload_value_selection_with_constraints(ctx: click.Context, value_s
     if workload_value_selection:
         result.to_csv(workload_value_selection, index=False)
     return result
-       
+
 
 if __name__ == "__main__":
     cli()

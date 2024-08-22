@@ -1,3 +1,4 @@
+import ast
 import collections
 from itertools import chain
 from pprint import pprint
@@ -9,6 +10,8 @@ from typing import (
 import typing
 import uuid
 
+import dateutil
+import pandas as pd
 from rdflib.plugins.sparql.parserutils import CompValue, Expr
 from rdflib.plugins.sparql.sparql import Query
 from rdflib.plugins.sparql.algebra import ExpressionNotCoveredException, traverse, _AlgebraTranslator, _traverseAgg, translateQuery
@@ -35,12 +38,27 @@ def extract_where(node, children):
     """
     if isinstance(node, CompValue):
         if node.name == "SelectQuery":
-            return node["where"]
-        
-    if len(children) > 0:
-        return children[-1] # Get the right most child
+            children.append([node["where"]])
+    
+    return list(chain(*children)) # Get the right most child
 
 def collect_variables(node, children):
+    """
+    Collects variables from the given node and its children.
+
+    Args:
+        node (Variable or Node): The node to collect variables from.
+        children (list): A list of children nodes.
+
+    Returns:
+        list: A list of collected variables.
+    """
+    
+    if isinstance(node, Variable):
+        children.append([node])
+    return list(chain(*children))
+
+def collect_triple_variables(node, children):
     """
     Collects variables from the given node and its children.
 
@@ -78,6 +96,11 @@ def disable_orderby_limit(node):
         node.pop("orderby", None)
         node.pop("limitoffset", None)
         return node
+    
+def disable_offset(node):
+    if isinstance(node, CompValue) and node.name == "LimitOffsetClauses":
+        node.pop("offset", None)
+        return node
 
 def inject_constant_into_placeholders(node, injection_dict):
     """
@@ -90,21 +113,35 @@ def inject_constant_into_placeholders(node, injection_dict):
     Returns:
         The modified node with constant values injected.
     """
+        
+    def normalize(value):
+        if str(value).startswith("http") or str(value).startswith("nodeID"): 
+            return URIRef(value)  
+        else:
+            
+            try: 
+                value = ast.literal_eval(str(value))
+                return Literal(value)
+            except ValueError: pass
+            except SyntaxError: pass
+            
+            try: 
+                dateutil.parser.parse(str(value))
+                return Literal(pd.to_datetime(value))
+            except ValueError: 
+                pass
+                
+        return Literal(value)
+    
     if isinstance(node, Variable):
         var_name = str(node)
         if var_name in injection_dict:
-            injection_value = injection_dict[var_name]
-            if isinstance(injection_value, str) and injection_value.startswith("http"):
-                return URIRef(injection_value)
-            return Literal(injection_dict[var_name])
+            return normalize(injection_dict[var_name])
     elif isinstance(node, CompValue):
         if node.name == "vars":
             var_name = str(node["var"])
             if var_name in injection_dict:
-                injection_value = injection_dict[var_name]
-                if isinstance(injection_value, str) and injection_value.startswith("http"):
-                    return URIRef(injection_value)
-                return Literal(injection_dict[var_name])
+                normalize(injection_dict[var_name])
 
 def add_graph_to_triple_pattern(node):
     """
@@ -163,15 +200,40 @@ def replace_select_projection_with_graph(node):
             )
         
     return node
+
+def is_node_placeholder(node):
+    return isinstance(node, CompValue) and node.name == "Placeholder"
+
+def is_node_literal(node, children):
+    if isinstance(node, CompValue):
+        expr = node.get("expr")
+        if expr and isinstance(expr, Literal):
+            children.append([True])
+    return list(chain(*children))
+
+def get_old_node(node):
+    """Recursively retrieve the original node from a placeholder node.
+
+    Args:
+        node (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """
+    if is_node_placeholder(node):
+        return get_old_node(node["old"])
+    return node
     
 def remove_expression_with_placeholder(node, consts): 
-    
+        
     if len(consts) == 0:
         return node
     
     if isinstance(node, Variable):
+        # If the variable is not a constant, return a placeholder
         if str(node) not in consts:
-            return CompValue("Placeholder")   
+            print(f"Variable {node} not in consts {consts}")
+            return CompValue("Placeholder", old=node)   
         return node
     elif isinstance(node, CompValue): 
         
@@ -183,8 +245,8 @@ def remove_expression_with_placeholder(node, consts):
             expr = node["expr"]
             new_expr = traverse(expr, visitPost=lambda x: remove_expression_with_placeholder(x, consts))
             #print(f"Expression: {new_expr}")
-            if isinstance(new_expr, CompValue) and new_expr.name == "Placeholder":
-                return CompValue("Placeholder")
+            if is_node_placeholder(new_expr):
+                return CompValue("Placeholder", old=expr["old"])
             else:
                 node["expr"] = new_expr
         
@@ -192,20 +254,23 @@ def remove_expression_with_placeholder(node, consts):
         elif is_binary_expr:
             has_empty_expr = False
             has_empty_other = False
+            is_other_literal = False
             
             expr = node["expr"]
             new_expr = traverse(expr, visitPost=lambda x: remove_expression_with_placeholder(x, consts))
-            #logger.debug(f"Expression: {new_expr}")
-            if isinstance(new_expr, CompValue) and new_expr.name == "Placeholder":
+            # print(f"Expression: {new_expr}")
+            if is_node_placeholder(new_expr):
                 has_empty_expr = True
             else:
                 node["expr"] = new_expr
                 
             other = node["other"]
+            is_other_literal = all(_traverseAgg(other, is_node_literal))
+
             # If the other expression is a placeholder, return a placeholder
-            if isinstance(other, CompValue) and other.name == "Placeholder":
-                return CompValue("Placeholder")
-                    
+            if is_node_placeholder(other):
+                return CompValue("Placeholder", old=other["old"])
+                                            
             # If the other expression is a list, pop the first element and transform it
             if not isinstance(other, list):
                 other = [other]
@@ -213,7 +278,7 @@ def remove_expression_with_placeholder(node, consts):
             new_other = []
             for o in other:
                 new_o = traverse(o, visitPost=lambda x: remove_expression_with_placeholder(x, consts))
-                if isinstance(new_o, CompValue) and new_o.name == "Placeholder":
+                if is_node_placeholder(new_o):
                     continue
                 new_other.append(new_o)
                 
@@ -222,24 +287,33 @@ def remove_expression_with_placeholder(node, consts):
 
             if len(new_other) == 0:
                 has_empty_other = True
-                                    
+                                                    
             if not has_empty_expr and not has_empty_other:
                 node["expr"] = new_expr
                 node["other"] = new_other
             elif has_empty_expr and has_empty_other:
-                return CompValue("Placeholder")
-            if has_empty_expr:
-                node["expr"] = new_other.pop(0)
+                return CompValue("Placeholder", old=node)
+            
+            if has_empty_expr:    
+                if is_other_literal:
+                    node["expr"] = get_old_node(expr)
+                elif isinstance(new_other, list):
+                    # Substitute the expression
+                    node["expr"] = new_other.pop(0)
                 
-                if len(new_other) == 0:
-                    has_empty_other = True
-                elif len(new_other) == 1:
-                    node["other"] = new_other[0]
+                    # Substitute the other expressions
+                    if len(new_other) == 0:
+                        has_empty_other = True
+                    elif len(new_other) == 1:
+                        node["other"] = new_other[0]
+                    else:
+                        node["other"] = new_other
                 else:
-                    node["other"] = new_other
-        
+                    node["expr"] = new_other
+                        
             if has_empty_other:
                 node.pop("other", None)
+            
         elif node.name == "Function":
             # Should have been treated in the previous step
             raise NotImplementedError("Function expressions are not supported yet")
@@ -247,32 +321,32 @@ def remove_expression_with_placeholder(node, consts):
             if node.name == "Builtin_BOUND":
                 arg = node["arg"]
                 new_arg = traverse(arg, visitPost=lambda x: remove_expression_with_placeholder(x, consts))
-                if isinstance(new_arg, CompValue) and new_arg.name == "Placeholder":
-                    return CompValue("Placeholder")
+                if is_node_placeholder(new_arg):
+                    return CompValue("Placeholder", old=arg)
                 node["arg"] = new_arg
             elif node.name == "Builtin_REGEX":
                 # Should have been treated in the previous 
                 new_text = traverse(node["text"], visitPost=lambda x: remove_expression_with_placeholder(x, consts))
-                if isinstance(new_text, CompValue) and new_text.name == "Placeholder":
-                    return CompValue("Placeholder")
+                if is_node_placeholder(new_text):
+                    return CompValue("Placeholder", old=node["text"])
                 
                 new_pattern = traverse(node["pattern"], visitPost=lambda x: remove_expression_with_placeholder(x, consts))
-                if isinstance(new_pattern, CompValue) and new_pattern.name == "Placeholder":
-                    return CompValue("Placeholder")
+                if is_node_placeholder(new_pattern):
+                    return CompValue("Placeholder", old=node["pattern"])
                 
                 node["text"] = new_text
                 node["pattern"] = new_pattern          
                 
         return node  
 
-def remove_filter_with_placeholders(node, consts):   
+def remove_filter_with_placeholders(node, consts): 
     query_consts = set(consts["query"])
     
     select_consts = None
     if "select" in consts.keys():
         select_consts = set(consts["select"]) & query_consts
     filter_consts = set(consts["filter"]) & query_consts
-            
+                
     if isinstance(node, CompValue):
         if node.name == "SelectQuery":
             if select_consts:
@@ -281,13 +355,16 @@ def remove_filter_with_placeholders(node, consts):
             return node
         
         if node.name == "Filter":
-            return traverse(node, visitPost=lambda x: remove_expression_with_placeholder(x, filter_consts))
+            # print("Before:", node)
+            node = traverse(node, visitPost=lambda x: remove_expression_with_placeholder(x, filter_consts))
+            # print("After:", node)
+            return node
         
         if "part" in node.keys():
             if isinstance(node["part"], list):
                 new_parts = []
                 for part in node["part"]:
-                    if isinstance(part, CompValue) and part.name == "Placeholder":
+                    if is_node_placeholder(part):
                         continue
                     new_parts.append(part)
                     
@@ -302,7 +379,7 @@ def add_values_with_placeholders(node, inline_data):
         if node.name == "SelectQuery":
             inline_data_keys = [ Variable(k) for k in inline_data.keys() ] 
             inline_data_values = [ 
-                [ URIRef(v) if v.startswith("http") else Literal(v) for v in values ]
+                [ URIRef(v) if str(v).startswith("http") else Literal(v) for v in values ]
                 for values in inline_data.values()
             ]
             if len(inline_data_keys) == 1:
@@ -435,9 +512,13 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
             elif node.name == "BGP":
                 # Identifiers or Paths
                 # Negated path throws a type error. Probably n3() method of negated paths should be fixed
-                triples = "".join(
-                    identation + triple[0].n3() + " " + triple[1].n3() + " " + triple[2].n3() + "." + self.__breakline_token
-                    for triple in node.triples
+                triples = (
+                    #identation + "{" + self.__breakline_token +
+                    "".join(
+                        identation + triple[0].n3() + " " + triple[1].n3() + " " + triple[2].n3() + "." + self.__breakline_token
+                        for triple in node.triples
+                    )
+                    #+ identation + "} ." + self.__breakline_token
                 )
                 self._replace("{BGP}", triples)
                 # The dummy -*-SELECT-*- is placed during a SelectQuery or Multiset pattern in order to be able
@@ -470,7 +551,7 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                         identation + "}" + self.__breakline_token
                     ),
                 )
-                self.__identation_level += 1
+                #self.__identation_level += 1
             elif node.name == "Filter":
                 if isinstance(node.expr, CompValue):
                     expr = node.expr.name
@@ -647,7 +728,7 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                 self._replace(
                     "{TriplesBlock}",
                     (
-                        #identation + "{" + self.__breakline_token +
+                        # identation + "{" + self.__breakline_token +
                         "".join(
                             identation
                             + triple[0].n3()
@@ -659,7 +740,7 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                             + self.__breakline_token
                             for triple in node.triples
                         )
-                        #identation + "}" + self.__breakline_token
+                        # + identation + "} ." + self.__breakline_token
                     ),
                 )
 
@@ -678,6 +759,20 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                         else:
                             cond = var
                         order_conditions.append(cond)
+                    elif isinstance(c.expr, CompValue):
+                        if c.expr.name == "Function":
+                            function_iri = c.expr.iri.n3()
+                            function_expr = c.expr.expr
+                            if isinstance(function_expr, list):
+                                function_expr = ", ".join(
+                                    self.convert_node_arg(expr) for expr in function_expr
+                                )
+                            function_str = f"{function_iri}({function_expr})"
+                            order_conditions.append(function_str)
+                        else:
+                            raise ExpressionNotCoveredException(
+                                "This expression might not be covered yet."
+                            )
                     else:
                         raise ExpressionNotCoveredException(
                             "This expression might not be covered yet."

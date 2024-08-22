@@ -290,7 +290,7 @@ def get_data_files(workdir, n_vendor, n_ratingsite):
         str: The data directory path.
     """
     
-    return [ f"vendor{vendor_id}.nq" for vendor_id in range(n_vendor) ] + [ f"ratingsite{ratingsite_id}.nq" for ratingsite_id in range(n_ratingsite) ]
+    return [ f"{workdir}/vendor{vendor_id}.nq" for vendor_id in range(n_vendor) ] + [ f"{workdir}/ratingsite{ratingsite_id}.nq" for ratingsite_id in range(n_ratingsite) ]
     
 # Register new resolvers
 OmegaConf.register_new_resolver("multiply", lambda *args: np.prod(args).item())

@@ -26,10 +26,11 @@ generation:
     default_endpoint: "${generation.virtuoso.default_url}/sparql"
     batch_members: "${get_batch_members:${generation.n_batch}}"
     federation_members: "${get_federation_members:${generation.n_batch}, ${generation.schema.vendor.params.vendor_n}, ${generation.schema.ratingsite.params.ratingsite_n}}"
-    # Batch 0 specific
-    service_name_batch0: "bsbm-virtuoso-batch0"
-    port_batch0: 8891
-    endpoint_batch0: "http://localhost:${generation.virtuoso.port_batch0}/sparql"
+    batches:
+      batch0:
+        service_name: "bsbm-virtuoso"
+        port: 8891
+        endpoint_batch0: "http://localhost:${generation.virtuoso.batches.batch0.port}/sparql"
 
 
   schema:

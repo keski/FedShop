@@ -12,7 +12,7 @@ smk_directory = os.path.abspath(workflow.basedir)
 print(smk_directory)
 sys.path.append(os.path.join(Path(smk_directory).parent, "fedshop"))
 
-from utils import ping, fedshop_logger, load_config
+from utils import ping, fedshop_logger, load_config, docker_check_container_running
 LOGGER = fedshop_logger(Path(__file__).name)
 
 #===============================
@@ -32,11 +32,15 @@ CONFIG = load_config(CONFIGFILE)
 CONFIG_GEN = CONFIG["generation"]
 CONFIG_EVAL = CONFIG["evaluation"]
 
+USE_DOCKER = CONFIG["use_docker"]
+
 SPARQL_COMPOSE_FILE = CONFIG_GEN["virtuoso"]["compose_file"]
-SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
 VIRTUOSO_COMPOSE_CONFIG = load_config(SPARQL_COMPOSE_FILE)
-SPARQL_CONTAINER_NAME = VIRTUOSO_COMPOSE_CONFIG["services"][SPARQL_SERVICE_NAME]["container_name"]
-DOCKER_EXEC_CMD = f"docker exec {SPARQL_CONTAINER_NAME}"
+VIRTUOSO_PROXY_MAPPING_FILE = CONFIG_GEN["virtuoso"]["proxy_mapping"]
+
+SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
+SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-1"
+SPARQL_DEFAULT_ENDPOINT = CONFIG_GEN["virtuoso"]["default_endpoint"]
 
 PROXY_COMPOSE_FILE =  CONFIG_EVAL["proxy"]["compose_file"]
 PROXY_SERVICE_NAME = CONFIG_EVAL["proxy"]["service_name"]
@@ -45,11 +49,9 @@ PROXY_SERVER = CONFIG_EVAL["proxy"]["endpoint"]
 PROXY_PORT = CONFIG_EVAL["proxy"]["port"]
 PROXY_SPARQL_ENDPOINT = PROXY_SERVER + "sparql"
 
+# Change this to your local path to the isql executable
 CONTAINER_PATH_TO_ISQL = "/opt/virtuoso-opensource/bin/isql"
 CONTAINER_PATH_TO_DATA = "/usr/share/proj/" 
-
-# CONTAINER_PATH_TO_ISQL = "/usr/local/virtuoso-opensource/bin/isql-v" 
-# CONTAINER_PATH_TO_DATA = "/usr/local/virtuoso-opensource/share/virtuoso/vad"
 
 N_QUERY_INSTANCES = CONFIG_GEN["n_query_instances"]
 VERBOSE = CONFIG_GEN["verbose"]
@@ -76,6 +78,13 @@ DEBUG = eval(str(config["debug"])) if config.get("explain") is not None else Fal
 # USEFUL FUNCTIONS
 #=================
 
+def ping(endpoint):
+    try:
+        req = requests.get(endpoint)
+        LOGGER.debug(f"{req}")
+        return req.status_code == 200
+    except requests.exceptions.ConnectionError:
+        return False
 
 #=================
 # PIPELINE
@@ -84,29 +93,26 @@ DEBUG = eval(str(config["debug"])) if config.get("explain") is not None else Fal
 rule all:
     input: 
         expand(
-                "{benchDir}/{query}/instance_{instance_id}/batch_{batch_id}/rsa.sparql",
+                "{benchDir}/{query}/instance_{instance_id}/results.csv",
                 benchDir=BENCH_DIR,
                 query=QUERY_PATH,
-                instance_id=INSTANCE_ID,
-                batch_id=BATCH_ID
+                instance_id=INSTANCE_ID
         )
 
-rule generate_rsa_queries:
-    input: "{benchDir}/{query}/instance_{instance_id}/composition.json"
-    output: "{benchDir}/{query}/instance_{instance_id}/batch_{batch_id}/rsa.sparql"
+rule execute_instances:
+    input: "{benchDir}/{query}/instance_{instance_id}/injected.sparql"
+    output: "{benchDir}/{query}/instance_{instance_id}/results.csv"
     params:
-        workload_instance="{benchDir}/{query}/instance_{instance_id}/injected.sparql"
+        endpoint_batch0 = SPARQL_DEFAULT_ENDPOINT
     run:
-        shell("python fedshop/engines/rsa.py create-service-query {CONFIGFILE} {params.workload_instance} {output} --batch-id {wildcards.batch_id}")
 
-rule decompose_query:
-    threads: 1
-    input: 
-        workload_instance="{benchDir}/{query}/instance_{instance_id}/injected.sparql",
-        loaded_virtuoso=f"{WORK_DIR}/virtuoso-federation-endpoints-ok.txt",
-    output: "{benchDir}/{query}/instance_{instance_id}/composition.json"
-    run: 
-        shell("python fedshop/query.py decompose-query {input.workload_instance} {output}")
+        if USE_DOCKER and not docker_check_container_running(SPARQL_CONTAINER_NAME):
+            shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
+            shell(f"docker start {SPARQL_CONTAINER_NAME}")
+            while not ping(SPARQL_DEFAULT_ENDPOINT):
+                LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
+                time.sleep(1)
+        shell("python fedshop/query.py execute-query {params.endpoint_batch0} --queryfile={input} --outfile={output}")
 
 rule instanciate_workload:
     threads: 1
@@ -115,19 +121,11 @@ rule instanciate_workload:
         workload_value_selection="{benchDir}/{query}/workload_value_selection.csv"
     output:
         injected_query="{benchDir}/{query}/instance_{instance_id}/injected.sparql",
-        # injection_cache="{benchDir}/{query}/instance_{instance_id}/injection_cache.json",
-        # prefix_cache="{benchDir}/{query}/instance_{instance_id}/prefix_cache.json"
     params:
         batch_id = 0
     run:
         shell("python fedshop/query.py instanciate-workload {input.queryfile} {input.workload_value_selection} {output.injected_query} {wildcards.instance_id}")
         
-        # in_injected_opt_query = f"{QUERY_DIR}/{wildcards.query}.injected.opt"
-        # out_injected_opt_query = f"{output.injected_query}.opt"
-
-        # if os.path.exists(in_injected_opt_query):
-        #     shell(f"python fedshop/query.py inject-from-cache {in_injected_opt_query} {output.injection_cache} {out_injected_opt_query}")
-
 rule create_workload_value_selection:
     threads: 5
     input: 
@@ -136,6 +134,13 @@ rule create_workload_value_selection:
     params:
         n_query_instances = N_QUERY_INSTANCES,
     run:
+        if USE_DOCKER and not docker_check_container_running(SPARQL_CONTAINER_NAME):
+            shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
+            shell(f"docker start {SPARQL_CONTAINER_NAME}")
+            while not ping(SPARQL_DEFAULT_ENDPOINT):
+                LOGGER.debug(f"Waiting for {SPARQL_BATCH0_ENDPOINT} to start...")
+                time.sleep(1)
+
         constfile = f"{QUERY_DIR}/{wildcards.query}.const.json"
         shell(f"python fedshop/query.py create-workload-value-selection {CONFIGFILE} {constfile} {input.value_selection_infos} {output} {params.n_query_instances}")
 

@@ -42,6 +42,15 @@ def fedshop_logger(logname):
 
 LOGGER = fedshop_logger(Path(__file__).name)
 
+def docker_check_container_running(container_name):
+    try:
+        cmd = f"docker inspect -f '{{{{.State.Running}}}}' {container_name}"
+        status = subprocess.check_output(f"docker inspect -f '{{{{.State.Running}}}}' {container_name}", shell=True)
+        status = status.decode("utf-8").strip()
+        return status == "true"
+    except subprocess.CalledProcessError:
+        return False
+
 def str2n3(value):
     if str(value).startswith("http") or str(value).startswith("nodeID"): 
         return URIRef(value).n3()

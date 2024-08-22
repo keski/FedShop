@@ -14,7 +14,7 @@ import sys
 smk_directory = os.path.abspath(workflow.basedir)
 sys.path.append(os.path.join(Path(smk_directory).parent, "fedshop"))
 
-from utils import ping, fedshop_logger, load_config, create_stats
+from utils import ping, fedshop_logger, load_config, create_stats, docker_check_container_running
 
 #===============================
 # EVALUATION PHASE:
@@ -38,7 +38,6 @@ SPARQL_COMPOSE_FILE = CONFIG_GEN["virtuoso"]["compose_file"]
 SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
 
 VIRTUOSO_COMPOSE_CONFIG = load_config(SPARQL_COMPOSE_FILE)
-SPARQL_CONTAINER_NAME = VIRTUOSO_COMPOSE_CONFIG["services"][SPARQL_SERVICE_NAME]["container_name"]
 
 # Modify the path to the Virtuoso ISQL executable and the path to the data
 VIRTUOSO_PATH_TO_ISQL = CONFIG_GEN["virtuoso"]["isql"]
@@ -196,7 +195,7 @@ rule evaluate_engines:
     retries: 1
     input: 
         query=ancient(expand("{workDir}/benchmark/generation/{{query}}/instance_{{instance_id}}/injected.sparql", workDir=WORK_DIR)),
-        virtuoso_ok=ancient(expand("{workDir}/virtuoso-federation-endpoints-ok.txt", workDir=WORK_DIR)),
+        #virtuoso_ok=ancient(expand("{workDir}/virtuoso-federation-endpoints-ok.txt", workDir=WORK_DIR)),
         engine_status=ancient("{benchDir}/{engine}/{engine}-ok.txt"),
     output: 
         stats="{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/stats.csv",
@@ -207,6 +206,14 @@ rule evaluate_engines:
         result_csv="{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/results.csv",
         last_batch=LAST_BATCH
     run: 
+        SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-{int(wildcards.batch_id)+1}"
+
+        if USE_DOCKER and not docker_check_container_running(SPARQL_CONTAINER_NAME):
+            shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
+            shell(f"docker start {SPARQL_CONTAINER_NAME}")
+            while not ping(SPARQL_DEFAULT_ENDPOINT):
+                LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
+                time.sleep(1)
 
         engine = str(wildcards.engine)
         batch_id = int(wildcards.batch_id)
