@@ -15,6 +15,8 @@ from omegaconf import OmegaConf
 import time
 import requests
 
+print(config)
+
 LOGGER = fedshop_logger(Path(__file__).name)
 
 CONFIGFILE = config["configfile"]
@@ -34,13 +36,11 @@ USE_DOCKER = CONFIG["use_docker"]
 
 SPARQL_COMPOSE_FILE = CONFIG_GEN["virtuoso"]["compose_file"]
 VIRTUOSO_COMPOSE_CONFIG = load_config(SPARQL_COMPOSE_FILE)
-VIRTUOSO_PROXY_MAPPING_FILE = CONFIG_GEN["virtuoso"]["proxy_mapping"]
-VIRTUOSO_PROXY_MAPPING_FILE_PREFIX = Path(VIRTUOSO_PROXY_MAPPING_FILE).stem
-VIRTUOSO_PROXY_MAPPING_FILE_EXT = ".json"
 
 SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
 SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}"
 SPARQL_DEFAULT_ENDPOINT = CONFIG_GEN["virtuoso"]["default_endpoint"]
+SPARQL_DEFAULT_PORT = CONFIG_GEN["virtuoso"]["port"]
 
 DOCKER_EXEC_CMD = f"docker exec {SPARQL_CONTAINER_NAME}"
 
@@ -55,6 +55,13 @@ if USE_DOCKER:
 N_QUERY_INSTANCES = CONFIG_GEN["n_query_instances"]
 VERBOSE = CONFIG_GEN["verbose"]
 N_BATCH = CONFIG_GEN["n_batch"]
+
+BATCHES = range(N_BATCH)
+
+if "batches" in config:
+    BATCHES = str(config["batches"]).split(",")
+    if len(BATCHES) == 0:
+        BATCHES = range(N_BATCH)
 
 global NET_PORT
 
@@ -71,6 +78,7 @@ def validate(filename):
 def ping(endpoint):
     try:
         req = requests.get(endpoint)
+        #LOGGER.debug(f"Response code: {req.status_code} for {endpoint}")
         return req.status_code == 200
     except requests.exceptions.ConnectionError:
         return False
@@ -90,7 +98,7 @@ rule all:
         expand(
             "{workDir}/virtuoso-federation-endpoints-batch{batch_id}-ok.txt",
             workDir=WORK_DIR,
-            batch_id=range(N_BATCH)
+            batch_id=BATCHES
         )
 
 rule create_federation_endpoints:
@@ -99,18 +107,15 @@ rule create_federation_endpoints:
     output: "{workDir}/virtuoso-federation-endpoints-batch{batch_id}-ok.txt"
     run:
         SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-{int(wildcards.batch_id)+1}"
-        shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
+        shell(f'docker compose -f {SPARQL_COMPOSE_FILE} stop')
         shell(f'docker start {SPARQL_CONTAINER_NAME}')
 
         while not ping(SPARQL_DEFAULT_ENDPOINT):
             LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
             time.sleep(1)
 
-        global NET_PORT
-        NET_PORT += N_BATCH
-
         proxy_mapping = {}
-        virtuoso_mapping_file = f"{VIRTUOSO_PROXY_MAPPING_FILE_PREFIX}-batch{wildcards.batch_id}{VIRTUOSO_PROXY_MAPPING_FILE_EXT}"
+        virtuoso_mapping_file = f"{WORK_DIR}/virtuoso-proxy-mapping-batch{wildcards.batch_id}.json"
 
         if os.path.exists(virtuoso_mapping_file):
             with open(virtuoso_mapping_file, "r") as f:
@@ -120,15 +125,14 @@ rule create_federation_endpoints:
         federation_members_info = CONFIG_GEN["virtuoso"]["federation_members"][f"batch{wildcards.batch_id}"]
         for fed_member_name, fed_member_iri in federation_members_info.items():
             lpath = f"/{fed_member_name}/sparql"
-            proxy_target = f"http://localhost:{NET_PORT}{lpath}"
-            host = f"localhost:{NET_PORT}"
+            proxy_target = f"http://localhost:{SPARQL_DEFAULT_PORT}{lpath}"
+            host = "localhost:{SPARQL_DEFAULT_PORT}{lpath}"
             proxy_mapping[fed_member_iri] = proxy_target
-            NET_PORT += 1
             
             if USE_DOCKER:
-                shell(f"python fedshop/virtuoso.py create-sparql-endpoint --container-name={SPARQL_CONTAINER_NAME} --on-duplicate=REPLACE --lpath={lpath} {host} {fed_member_iri}")
+                shell(f"python fedshop/virtuoso.py create-sparql-endpoint --container-name={SPARQL_CONTAINER_NAME} --on-duplicate=REPLACE --lpath={lpath} {fed_member_iri}")
             else:
-                shell(f'python fedshop/virtuoso.py create-sparql-endpoint --isql="{VIRTUOSO_PATH_TO_ISQL}" --on-duplicate=REPLACE --lpath={lpath} {host} {fed_member_iri}')
+                shell(f'python fedshop/virtuoso.py create-sparql-endpoint --isql="{VIRTUOSO_PATH_TO_ISQL}" --on-duplicate=REPLACE --lpath={lpath} {fed_member_iri}')
 
         with open(virtuoso_mapping_file, "w") as f:
             json.dump(proxy_mapping, f)
@@ -142,19 +146,20 @@ rule ingest_data:
     run:
         SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-{int(wildcards.batch_id)+1}"
         if USE_DOCKER:
-            shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
+            shell(f'docker compose -f {SPARQL_COMPOSE_FILE} stop')
             shell(f'docker start {SPARQL_CONTAINER_NAME}')
             while not ping(SPARQL_DEFAULT_ENDPOINT):
                 LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
                 time.sleep(1)
             
-            shell(f'python fedshop/virtuoso.py ingest-data --container-name {SPARQL_CONTAINER_NAME} --datafiles "{",".join(input.datafiles)}"')
+            datafiles = [ f.replace(DATA_DIR + "/", "") for f in input.datafiles ]
+            shell(f'python fedshop/virtuoso.py ingest-data --container-name {SPARQL_CONTAINER_NAME} --datafiles "{",".join(datafiles)}"')
         else:
-            shell(f'python fedshop/virtuoso.py ingest-data --isql "{VIRTUOSO_PATH_TO_ISQL}" --datapath {os.path.realpath(VIRTUOSO_PATH_TO_DATA)} --datafiles "{",".join(input.datafiles)}"')
+            shell(f'python fedshop/virtuoso.py ingest-data --isql "{VIRTUOSO_PATH_TO_ISQL}" --datapath {os.path.realpath(VIRTUOSO_PATH_TO_DATA)} --datafiles "{",".join(datafiles)}"')
         
         validate(str(output))
 
 rule create_batches:
     output: "{workDir}/virtuoso-containers-ok.txt"
     run:
-        shell(f"docker-compose -f {SPARQL_COMPOSE_FILE} create --no-recreate --scale {SPARQL_SERVICE_NAME}={N_BATCH} && touch {output}")
+        shell(f"docker compose -f {SPARQL_COMPOSE_FILE} create --no-recreate --scale {SPARQL_SERVICE_NAME}={N_BATCH} && touch {output}")

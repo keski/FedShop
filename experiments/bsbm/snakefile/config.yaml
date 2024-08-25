@@ -21,18 +21,10 @@ generation:
     isql: "/Applications/Virtuoso Open Source Edition v7.2.app/Contents/virtuoso-opensource/bin/isql" # Skip if use docker
     data_dir: "${generation.workdir}/model/dataset"
     port: 8890
-    proxy_mapping: "${generation.workdir}/virtuoso-proxy-mapping.json"
     default_url: "http://localhost:${generation.virtuoso.port}"
     default_endpoint: "${generation.virtuoso.default_url}/sparql"
     batch_members: "${get_batch_members:${generation.n_batch}}"
     federation_members: "${get_federation_members:${generation.n_batch}, ${generation.schema.vendor.params.vendor_n}, ${generation.schema.ratingsite.params.ratingsite_n}}"
-    batches:
-      batch0:
-        service_name: "bsbm-virtuoso"
-        port: 8891
-        endpoint_batch0: "http://localhost:${generation.virtuoso.batches.batch0.port}/sparql"
-
-
   schema:
     # Configuration for ONE batch
     product:
@@ -116,7 +108,7 @@ evaluation:
     targets: "${get_proxy_target: }"
   engines:
     fedx:
-      dir: "engines/FedX/target"
+      dir: "engines/FedX"
     costfed:
       dir: "engines/CostFed"
     splendid:
@@ -133,10 +125,10 @@ evaluation:
     fedup:
       dir: "engines/fedup"
     rsa:
-     dir: "engines/ARQ"
-     fedup_dir: "${evaluation.engines.fedup.dir}"
-     internal_endpoint_prefix: "http://localhost:8890/sparql/?default-graph-uri="
-     compose_file: "${generation.workdir}/docker/jena.yml"
-     service_name: "jena-fuseki"
-     endpoint: "http://localhost:3030/FedShop/query"
-     container_name: "docker-jena-fuseki-1"
+      dir: "engines/ARQ"
+      fedup_dir: "${evaluation.engines.fedup.dir}"
+      internal_endpoint_prefix: "http://localhost:8890/sparql/?default-graph-uri="
+      compose_file: "${generation.workdir}/docker/jena.yml"
+      service_name: "jena-fuseki"
+      endpoint: "http://localhost:3030/FedShop/query"
+      container_name: "docker-jena-fuseki-1"

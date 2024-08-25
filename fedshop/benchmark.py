@@ -19,13 +19,14 @@ def cli():
 @click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.option("--clean", is_flag=True, default=False)
 @click.option("--cores", type=click.INT, default=1, help="The number of cores used allocated. -1 if use all cores.")
+@click.option("--config", type=click.STRING, default=None, help='Params for snakemake file. Example: --config="batches=0,1,2"')
 @click.option("--rerun-incomplete", is_flag=True, default=False)
 @click.option("--touch", is_flag=True, default=False)
 @click.option("--no-cache", is_flag=True, default=False)
 @click.option("--dry-run", is_flag=True, default=False)
 @click.option("--force", is_flag=True, default=False)
 @click.pass_context
-def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch, no_cache, dry_run, force):
+def ingest(ctx: click.Context, configfile, clean, cores, config, rerun_incomplete, touch, no_cache, dry_run, force):
     """Ingest the data
 
     Args:
@@ -44,13 +45,33 @@ def ingest(ctx: click.Context, configfile, clean, cores, rerun_incomplete, touch
     INGESTION_SNAKEFILE = f"snakemake/ingest-data.smk"
     WORKFLOW_DIR = f"{WORK_DIR}/rulegraph"
     os.makedirs(name=WORKFLOW_DIR, exist_ok=True)
+
+    config_dict = {
+        "configfile": [configfile],
+    }
+    
+    if config is not None:
+        config = config.strip()
+        SNAKEMAKE_CONFIG_MATCHER = re.match(r"(\w+\=\w+(,\w+)*(\s+)?)+", config)
+        if SNAKEMAKE_CONFIG_MATCHER is None:
+            raise RuntimeError(f"Syntax error: config option should be 'name1=value1 name2=value2'")
+        
+        for c in config.split():
+            k, v = c.split("=")
+
+            if k in ["debug", "explain"]:
+                v = eval(v)
+
+            config_dict[k] = v.split(",")
+    
+    SNAKEMAKE_CONFIGS = " ".join([f"{k}={','.join(v)}" for k, v in config_dict.items()])
     
     SNAKEMAKE_OPTS = ""
     
     if force:
         SNAKEMAKE_OPTS += " -F"
 
-    SNAKEMAKE_OPTS += f" -p --cores {cores} --config configfile={configfile}"
+    SNAKEMAKE_OPTS += f" -p --cores {cores} --config {SNAKEMAKE_CONFIGS}"
     if rerun_incomplete: SNAKEMAKE_OPTS += " --rerun-incomplete"
     if dry_run: SNAKEMAKE_OPTS += " --dry-run"
     
@@ -164,8 +185,8 @@ def generate(ctx: click.Context, category, configfile, config, debug, clean, cor
         ctx.invoke(wipe, configfile=configfile, level=clean)
 
     for batch in range(1, N_BATCH+1):
-        logger.info(f"Producing metrics for batch {batch}/{N_BATCH}...")
-        if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {GENERATION_SNAKEFILE} --batch merge_metrics={batch}/{N_BATCH}") != 0 : exit(1)
+        logger.info(f"Generating instances for batch {batch}/{N_BATCH}...")
+        if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {GENERATION_SNAKEFILE} --batch all={batch}/{N_BATCH}") != 0 : exit(1)
 
 @cli.command()
 @click.argument("experiment-dir", type=click.Path(exists=True, file_okay=False, dir_okay=True))
@@ -299,15 +320,8 @@ def evaluate(ctx: click.Context, configfile, config, debug, clean, cores, rerun_
     batch_size = len(config_dict["batch"]) if "batch" in config_dict.keys() else N_BATCH
     
     for batch in range(1, batch_size+1):
-        if debug:
-            logger.info("Producing rulegraph...")
-            RULEGRAPH_FILE = f"{WORKFLOW_DIR}/rulegraph_generate_batch{batch}"
-            if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {EVALUATION_SNAKEFILE} --debug-dag --batch merge_metrics={batch}/{batch_size}") != 0 : exit(1)
-            if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {EVALUATION_SNAKEFILE} --rulegraph > {RULEGRAPH_FILE}.dot") != 0 : exit(1)
-            if os.system(f"dot -Tpng {RULEGRAPH_FILE}.dot > {RULEGRAPH_FILE}.png") != 0 : exit(1)
-        else:
-            logger.info(f"Producing metrics for batch {batch}/{batch_size}...")
-            if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {EVALUATION_SNAKEFILE} --batch merge_metrics={batch}/{batch_size}") != 0 : exit(1)
+        logger.info(f"Producing metrics for batch {batch}/{batch_size}...")
+        if os.system(f"snakemake {SNAKEMAKE_OPTS} --snakefile {EVALUATION_SNAKEFILE} --batch merge_metrics={batch}/{batch_size}") != 0 : exit(1)
             
 @cli.command()
 @click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
@@ -344,7 +358,7 @@ def wipe(configfile, level: str):
         
     if "db" in args:
         logger.info("Cleaning all databases...")
-        if os.system(f"docker-compose -f {SPARQL_COMPOSE_FILE} down --remove-orphans --volumes") != 0 : exit(1)  
+        if os.system(f"docker compose -f {SPARQL_COMPOSE_FILE} down --remove-orphans --volumes") != 0 : exit(1)  
         if os.system("docker volume prune --force") != 0: exit(1)
         os.system(f"{WORK_DIR}/benchmark/generation/virtuoso_batch*.csv")
         os.system(f"{WORK_DIR}/benchmark/generation/virtuoso-*.csv")
@@ -382,7 +396,7 @@ def wipe(configfile, level: str):
 
     if "all" in args:
         logger.info("Cleaning all databases...")
-        if os.system(f"docker-compose -f {SPARQL_COMPOSE_FILE} down --remove-orphans --volumes") != 0 : exit(1)  
+        if os.system(f"docker compose -f {SPARQL_COMPOSE_FILE} down --remove-orphans --volumes") != 0 : exit(1)  
         if os.system("docker volume prune --force") != 0: exit(1)
         Path(f"{WORK_DIR}/generator-ok.txt").unlink(missing_ok=True)
         shutil.rmtree(f"{WORK_DIR}/model/tmp", ignore_errors=True)

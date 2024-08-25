@@ -6,6 +6,7 @@ import time
 import requests
 import subprocess
 import re
+from itertools import product
 
 import sys
 smk_directory = os.path.abspath(workflow.basedir)
@@ -36,10 +37,8 @@ USE_DOCKER = CONFIG["use_docker"]
 
 SPARQL_COMPOSE_FILE = CONFIG_GEN["virtuoso"]["compose_file"]
 VIRTUOSO_COMPOSE_CONFIG = load_config(SPARQL_COMPOSE_FILE)
-VIRTUOSO_PROXY_MAPPING_FILE = CONFIG_GEN["virtuoso"]["proxy_mapping"]
 
 SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
-SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-1"
 SPARQL_DEFAULT_ENDPOINT = CONFIG_GEN["virtuoso"]["default_endpoint"]
 
 PROXY_COMPOSE_FILE =  CONFIG_EVAL["proxy"]["compose_file"]
@@ -63,7 +62,7 @@ BENCH_DIR = f"{WORK_DIR}/benchmark/generation"
 TEMPLATE_DIR = f"{MODEL_DIR}/watdiv"
 
 # Override settings if specified in the config file
-BATCH_ID = str(config["batch"]).split(",") if config.get("batch") is not None else range(N_BATCH)
+BATCHES = str(config["batch"]).split(",") if config.get("batch") is not None else range(N_BATCH)
 QUERY_PATH = (
     [Path(os.path.join(QUERY_DIR, f)).resolve().stem for f in str(config["query"]).split(",")] 
     if config.get("query") is not None else 
@@ -86,6 +85,20 @@ def ping(endpoint):
     except requests.exceptions.ConnectionError:
         return False
 
+def get_results_per_batch(wildcards):
+    def combinator(benchDir, query, instance_id, batch_id):
+        for batch_id_u, benchDir_u, query_u, instance_id_u in product(batch_id, benchDir, query, instance_id):
+            yield benchDir_u, query_u, instance_id_u, batch_id_u
+
+    return expand(
+        "{benchDir}/{query}/instance_{instance_id}/results-batch{batch_id}.csv",
+        combinator,
+        benchDir=BENCH_DIR,
+        query=QUERY_PATH,
+        instance_id=INSTANCE_ID,
+        batch_id=BATCHES
+    )
+
 #=================
 # PIPELINE
 #=================
@@ -93,25 +106,37 @@ def ping(endpoint):
 rule all:
     input: 
         expand(
-                "{benchDir}/{query}/instance_{instance_id}/results.csv",
-                benchDir=BENCH_DIR,
-                query=QUERY_PATH,
-                instance_id=INSTANCE_ID
+            "{benchDir}/generate-batch{batch_id}.txt", 
+            benchDir=BENCH_DIR, batch_id=BATCHES
         )
 
+rule generate_batch:
+    input: 
+        expand(
+            "{{benchDir}}/{query}/instance_{instance_id}/results-batch{{batch_id}}.csv",
+            query=QUERY_PATH, 
+            instance_id=INSTANCE_ID
+        )
+    output: "{benchDir}/generate-batch{batch_id}.txt"
+    shell: "echo 'ok' > {output}"
+        
 rule execute_instances:
     input: "{benchDir}/{query}/instance_{instance_id}/injected.sparql"
-    output: "{benchDir}/{query}/instance_{instance_id}/results.csv"
+    output: "{benchDir}/{query}/instance_{instance_id}/results-batch{batch_id}.csv"
     params:
         endpoint_batch0 = SPARQL_DEFAULT_ENDPOINT
     run:
-
+        SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-{int(wildcards.batch_id)+1}"
         if USE_DOCKER and not docker_check_container_running(SPARQL_CONTAINER_NAME):
-            shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
+            shell(f'docker compose -f {SPARQL_COMPOSE_FILE} stop')
             shell(f"docker start {SPARQL_CONTAINER_NAME}")
             while not ping(SPARQL_DEFAULT_ENDPOINT):
                 LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
                 time.sleep(1)
+
+        composition_file = f"{Path(str(input)).parent}/decomposition.json"
+        if not os.path.exists(composition_file):
+            shell("python fedshop/query.py decompose-query {input} {composition_file}")
         shell("python fedshop/query.py execute-query {params.endpoint_batch0} --queryfile={input} --outfile={output}")
 
 rule instanciate_workload:
@@ -134,11 +159,12 @@ rule create_workload_value_selection:
     params:
         n_query_instances = N_QUERY_INSTANCES,
     run:
+        SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-1"
         if USE_DOCKER and not docker_check_container_running(SPARQL_CONTAINER_NAME):
-            shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
+            shell(f'docker compose -f {SPARQL_COMPOSE_FILE} stop')
             shell(f"docker start {SPARQL_CONTAINER_NAME}")
             while not ping(SPARQL_DEFAULT_ENDPOINT):
-                LOGGER.debug(f"Waiting for {SPARQL_BATCH0_ENDPOINT} to start...")
+                LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
                 time.sleep(1)
 
         constfile = f"{QUERY_DIR}/{wildcards.query}.const.json"

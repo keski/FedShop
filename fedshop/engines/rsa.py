@@ -81,7 +81,7 @@ def warmup(ctx: click.Context, eval_config, engine_config, repeat, batch_id):
     if ping(endpoint) == -1:
         compose_file = config["evaluation"]["engines"]["rsa"]["compose_file"]
         service_name = config["evaluation"]["engines"]["rsa"]["service_name"]
-        if os.system(f"docker-compose -f {compose_file} up -d {service_name}") != 0:
+        if os.system(f"docker compose -f {compose_file} up -d {service_name}") != 0:
             raise RuntimeError("Could not setup Jena Docker Container...")
     
     while ping(endpoint) != 200:
@@ -143,7 +143,7 @@ def create_service_query_manually(ctx: click.Context, eval_config, query, query_
     query_algebra = traverse(query_algebra, visitPost=lambda node: add_values_with_placeholders(node, inline_data))
     query_algebra = traverse(query_algebra, visitPost=lambda node: add_service_to_triple_blocks(node, inline_data))
     
-    export_query(query_algebra, query_options, pretty=True, outfile=query_plan)
+    export_query(query_algebra, query_options, outfile=query_plan)
     
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))

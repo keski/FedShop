@@ -11,17 +11,17 @@ services:
       VIRT_SPARQL_ResultSetMaxRows: 0
       VIRT_SPARQL_MaxQueryExecutionTime: 0
       # Uncomment next two lines if there is 8 GB system memory free
-      # VIRT_Parameters_NumberOfBuffers: 680000
-      # VIRT_Parameters_MaxDirtyBuffers: 500000
+      VIRT_Parameters_NumberOfBuffers: 680000
+      VIRT_Parameters_MaxDirtyBuffers: 500000
       # Uncomment next two lines if there is 16 GB system memory free
       # VIRT_Parameters_NumberOfBuffers: 1360000
       # VIRT_Parameters_MaxDirtyBuffers: 1000000
 
       # Uncomment next two lines if there is 32 GB system memory free
-      VIRT_Parameters_NumberOfBuffers: 2720000
-      VIRT_Parameters_MaxDirtyBuffers: 2000000
+      # VIRT_Parameters_NumberOfBuffers: 2720000
+      # VIRT_Parameters_MaxDirtyBuffers: 2000000
       
-      VIRT_Parameters_MaxQueryMem: 4G # 2G by default
+      VIRT_Parameters_MaxQueryMem: 2G # 2G by default
       VIRT_Parameters_MaxClientConnections: 20
       VIRT_Parameters_IndexTreeMaps: 256
       VIRT_Parameters_CheckpointInterval: 0
@@ -35,7 +35,7 @@ services:
     volumes:
       - "../model/dataset:/usr/share/proj"
     network_mode: "host"
-    ports:
-      - 1111:1111
-      - 8890:8890
+    # ports:
+    #   - 1111:1111
+    #   - 8890:8890
 

@@ -36,6 +36,7 @@ CONFIG_EVAL = CONFIG["evaluation"]
 
 SPARQL_COMPOSE_FILE = CONFIG_GEN["virtuoso"]["compose_file"]
 SPARQL_SERVICE_NAME = CONFIG_GEN["virtuoso"]["service_name"]
+SPARQL_DEFAULT_ENDPOINT = CONFIG_GEN["virtuoso"]["default_endpoint"]
 
 VIRTUOSO_COMPOSE_CONFIG = load_config(SPARQL_COMPOSE_FILE)
 
@@ -49,7 +50,7 @@ if USE_DOCKER:
 
 PROXY_COMPOSE_FILE =  CONFIG_EVAL["proxy"]["compose_file"]
 PROXY_SERVICE_NAME = CONFIG_EVAL["proxy"]["service_name"]
-PROXY_CONTAINER_NAMES = CONFIG_EVAL["proxy"]["container_name"]
+PROXY_CONTAINER_NAME = CONFIG_EVAL["proxy"]["container_name"]
 PROXY_SERVER = CONFIG["evaluation"]["proxy"]["endpoint"]
 PROXY_PORT = re.search(r":(\d+)", PROXY_SERVER).group(1)
 PROXY_SPARQL_ENDPOINT = PROXY_SERVER + "sparql"
@@ -208,12 +209,21 @@ rule evaluate_engines:
     run: 
         SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-{int(wildcards.batch_id)+1}"
 
-        if USE_DOCKER and not docker_check_container_running(SPARQL_CONTAINER_NAME):
-            shell(f'docker-compose -f {SPARQL_COMPOSE_FILE} stop')
-            shell(f"docker start {SPARQL_CONTAINER_NAME}")
-            while not ping(SPARQL_DEFAULT_ENDPOINT):
-                LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
-                time.sleep(1)
+        if USE_DOCKER:
+            if not docker_check_container_running(SPARQL_CONTAINER_NAME):
+                shell(f'docker compose -f {SPARQL_COMPOSE_FILE} stop')
+                shell(f"docker start {SPARQL_CONTAINER_NAME}")
+                while not ping(SPARQL_DEFAULT_ENDPOINT):
+                    LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
+                    time.sleep(1)
+            if not docker_check_container_running(PROXY_CONTAINER_NAME):
+                shell(f'docker compose -f {PROXY_COMPOSE_FILE} stop')
+                shell(f"docker start {PROXY_CONTAINER_NAME}")
+                while not ping(PROXY_SPARQL_ENDPOINT):
+                    LOGGER.debug(f"Waiting for {PROXY_SPARQL_ENDPOINT} to start...")
+                    time.sleep(1)
+        
+
 
         engine = str(wildcards.engine)
         batch_id = int(wildcards.batch_id)

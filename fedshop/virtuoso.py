@@ -148,8 +148,8 @@ def update_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host
     if on_duplicate:
         insert_mode = "REPLACING" if on_duplicate == "REPLACE" else "SOFT"
 
-    exec = f"INSERT {insert_mode} DB.DBA.SYS_SPARQL_HOST (SH_HOST, SH_GRAPH_URI) VALUES (\'{host}\', \'{graph_uri}\');"
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    exec_cmd = f"INSERT {insert_mode} DB.DBA.SYS_SPARQL_HOST (SH_HOST, SH_GRAPH_URI) VALUES (\'{host}\', \'{graph_uri}\');"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
 @cli.command()
 @click.option("--container-name", type=click.STRING)
@@ -176,8 +176,8 @@ def remove_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host
         click.echo(f"Deleting SPARQL host for host {host}.")
         delete_condition = f"SH_HOST = \'{host}\'"
 
-    exec = f"DELETE FROM DB.DBA.SYS_SPARQL_HOST WHERE {delete_condition} ;"
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    exec_cmd = f"DELETE FROM DB.DBA.SYS_SPARQL_HOST WHERE {delete_condition} ;"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
 @cli.command()
 @click.option("--container-name", type=click.STRING)
@@ -187,13 +187,13 @@ def remove_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host
 @click.argument("lpath", type=click.STRING)
 @click.pass_context
 def remove_sparql_endpoint(ctx: click.Context, container_name, isql, vhost, lhost, lpath):
-    exec = f"DB.DBA.VHOST_REMOVE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\') ;"
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    exec_cmd = f"DB.DBA.VHOST_REMOVE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\') ;"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
     
 @cli.command()
 @click.option("--container-name", type=click.STRING)
 @click.option("--isql", type=click.STRING, default="/opt/virtuoso-opensource/bin/isql")
-@click.argument("host", type=click.STRING)
+@click.option("--host", type=click.STRING, default="*ini*:*ini*")
 @click.argument("graph-uri", type=click.STRING)
 @click.option("--lpath", type=click.STRING, default="/sparql")
 @click.option("--on-duplicate", type=click.Choice(["IGNORE", "REPLACE"]))
@@ -204,11 +204,16 @@ def create_sparql_endpoint(ctx: click.Context, container_name, isql, host, graph
 
     ctx.invoke(remove_sparql_endpoint, container_name=container_name, isql=isql, vhost=vhost, lhost=lhost, lpath=lpath)
     
-    exec = f"DB.DBA.VHOST_DEFINE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    #exec_cmd = f"DB.DBA.VHOST_DEFINE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_brws=>1, is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
+    exec_cmd = f"DB.DBA.VHOST_DEFINE(lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
     #ctx.invoke(remove_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=host)
-    ctx.invoke(update_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=host, on_duplicate=on_duplicate)
+    if vhost == "*ini*": vhost = "localhost"
+    if vport == "*ini*": vport = "8890"
+    sh_host = f"{vhost}:{vport}{lpath}" # e.g localhost:8890/vendor0/sparql
+
+    ctx.invoke(update_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=sh_host, on_duplicate=on_duplicate)
 
 @cli.command()
 @click.option("--container-name", type=click.STRING)
@@ -234,13 +239,13 @@ def create_graph_group(ctx: click.Context, container_name, isql, drop_first, gra
         ctx.invoke(drop_graph_group, container_name=container_name, isql=isql, graph_uri=graph_uri)
 
     # Create the graph group
-    exec = f"DB.DBA.RDF_GRAPH_GROUP_CREATE(group_iri=>\'{graph_uri}\', quiet=>1) ;"
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    exec_cmd = f"DB.DBA.RDF_GRAPH_GROUP_CREATE(group_iri=>\'{graph_uri}\', quiet=>1) ;"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
     # Enable unauthenticated users to access the graph
     # bit mask: 1 (read) + 8 (access to group's members) = 9
-    exec = f"DB.DBA.RDF_GRAPH_USER_PERMS_SET (\'{graph_uri}\', \'nobody\', 9);"
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    exec_cmd = f"DB.DBA.RDF_GRAPH_USER_PERMS_SET (\'{graph_uri}\', \'nobody\', 9);"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
 @cli.command()
 @click.option("--container-name", type=click.STRING)
@@ -248,8 +253,8 @@ def create_graph_group(ctx: click.Context, container_name, isql, drop_first, gra
 @click.argument("graph-uri", type=click.STRING)
 @click.pass_context
 def drop_graph_group(ctx: click.Context, container_name, isql, graph_uri):
-    exec = f"DB.DBA.RDF_GRAPH_GROUP_DROP(group_iri=>\'{graph_uri}\', quiet=>1) ;"
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    exec_cmd = f"DB.DBA.RDF_GRAPH_GROUP_DROP(group_iri=>\'{graph_uri}\', quiet=>1) ;"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
 @cli.command()
 @click.argument("action", type=click.Choice(["INS", "DEL", "GET"]))
@@ -259,20 +264,20 @@ def drop_graph_group(ctx: click.Context, container_name, isql, graph_uri):
 @click.option("--member-iri", type=click.STRING)
 @click.pass_context
 def update_graph_group(ctx: click.Context, action, container_name, isql, graph_group, member_iri):
-    exec = ""
+    exec_cmd = ""
     if action in ["INS", "DEL"]:
-        exec = f"DB.DBA.RDF_GRAPH_GROUP_{action}(group_iri=>\'{graph_group}\', memb_iri=>\'{member_iri}\') ;"
+        exec_cmd = f"DB.DBA.RDF_GRAPH_GROUP_{action}(group_iri=>\'{graph_group}\', memb_iri=>\'{member_iri}\') ;"
     elif action == "GET":
         if graph_group and member_iri:
-            exec = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER WHERE RGGM_GROUP_IID = \'{graph_group}\' and RGGM_MEMBER_IID = \'{member_iri}\' ;"
+            exec_cmd = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER WHERE RGGM_GROUP_IID = \'{graph_group}\' and RGGM_MEMBER_IID = \'{member_iri}\' ;"
         elif graph_group:
-            exec = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER WHERE RGGM_GROUP_IID = \'{graph_group}\' ;"
+            exec_cmd = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER WHERE RGGM_GROUP_IID = \'{graph_group}\' ;"
         elif member_iri:
-            exec = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER WHERE RGGM_MEMBER_IID = \'{member_iri}\' ;"
+            exec_cmd = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER WHERE RGGM_MEMBER_IID = \'{member_iri}\' ;"
         else:
-            exec = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER ;"
+            exec_cmd = f"SELECT * FROM DB.DBA.RDF_GRAPH_GROUP_MEMBER ;"
 
-    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec)
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
 @cli.command()
 @click.option("--container-name", type=click.STRING)

@@ -342,7 +342,7 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
         if kind == "exclusive":
             subqueries[f"sq{subq_id}"] = {
                 "kind": kind,
-                "query": export_query(subq_bgp_algebra, options, pretty=True)
+                "query": export_query(subq_bgp_algebra, options)
             }
                             
         elif kind == "join":
@@ -350,7 +350,7 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
             subq_algebra = traverse(algebra, visitPost=lambda node: build_sub_query(node, new_where=subq_bgp_algebra, new_proj=subq_consts))
             subqueries[f"sq{subq_id}"] = {
                 "kind": kind,
-                "query": export_query(subq_algebra, options, pretty=True)
+                "query": export_query(subq_algebra, options)
             }
             
         elif kind == "optional":
@@ -359,7 +359,7 @@ def build_value_selection_query(ctx: click.Context, queryfile, constfile, outfil
             subq_algebra = traverse(algebra, visitPost=lambda node: build_sub_query(node, new_where=subq_bgp_algebra, new_proj=subq_consts))
             subqueries[f"sq{subq_id}"] = {
                 "kind": kind,
-                "query": export_query(subq_algebra, options, pretty=True)
+                "query": export_query(subq_algebra, options)
             }
 
         else:
@@ -397,7 +397,7 @@ def instanciate_workload(ctx: click.Context, queryfile, value_selection, outfile
     algebra, options = ctx.invoke(parse_query, queryfile=queryfile)
     algebra = traverse(algebra, visitPost=lambda node: inject_constant_into_placeholders(node, placeholder_chosen_values))
     algebra = traverse(algebra, visitPost=disable_offset)
-    export_query(algebra, options, outfile=outfile, pretty=True)
+    export_query(algebra, options, outfile=outfile)
 
 @cli.command()
 @click.argument("provenance", type=click.Path(exists=True, file_okay=True, dir_okay=False))
@@ -549,9 +549,9 @@ def parse_query(queryfile, querydata, print_algebra, translate):
         pprint(algebra)
     return algebra, misc
     
-def export_query(algebra, options, pretty=False, outfile=None):
+def export_query(algebra, options, outfile=None):
     translated = translateQuery(algebra)
-    query = translateAlgebra(translated, pretty=pretty)
+    query = translateAlgebra(translated)
     
     # Remove empty lines
     with StringIO(query) as qfs:
@@ -608,7 +608,7 @@ def build_provenance_query(ctx: click.Context, queryfile, outfile):
     algebra = traverse(algebra, visitPost=replace_select_projection_with_graph)
     algebra = traverse(algebra, visitPost=disable_orderby_limit)
     algebra = traverse(algebra, visitPost=disable_offset)
-    export_query(algebra, options, outfile=outfile, pretty=True)
+    export_query(algebra, options, outfile=outfile)
         
 @cli.command()
 @click.argument("configfile", type=click.Path(exists=True, file_okay=True, dir_okay=False))
@@ -631,14 +631,7 @@ def create_workload_value_selection(ctx: click.Context, configfile, constfile, s
     
     # Read config
     config = load_config(configfile)
-    # batch0_graph = config["generation"]["virtuoso"]["batch_members"][0]
-    # batch0_endpoint = None
-    # proxy_mapping_file = config["generation"]["virtuoso"]["proxy_mapping"]
-    # with open(proxy_mapping_file, "r") as pmfs:
-    #     proxy_mapping = json.load(pmfs)
-    #     batch0_endpoint = proxy_mapping[batch0_graph]
-    
-    batch0_endpoint = config["generation"]["virtuoso"]["endpoint_batch0"]
+    batch0_endpoint = config["generation"]["virtuoso"]["default_endpoint"]
 
     # Get subqueries
     subqueries = {}
@@ -708,14 +701,7 @@ def create_workload_value_selection_with_exclusive(ctx: click.Context, configfil
             
     # Read config
     config = load_config(configfile)
-    # batch0_graph = config["generation"]["virtuoso"]["batch_members"][0]
-    # batch0_endpoint = None
-    # proxy_mapping_file = config["generation"]["virtuoso"]["proxy_mapping"]
-    # with open(proxy_mapping_file, "r") as pmfs:
-    #     proxy_mapping = json.load(pmfs)
-    #     batch0_endpoint = proxy_mapping[batch0_graph]
-    
-    batch0_endpoint = config["generation"]["virtuoso"]["endpoint_batch0"]
+    batch0_endpoint = config["generation"]["virtuoso"]["default_endpoint"]
     
     # Composition
     comp = {}
@@ -758,7 +744,7 @@ def create_workload_value_selection_with_exclusive(ctx: click.Context, configfil
         tmp_query_algebra = traverse(tmp_query_algebra, visitPost=lambda node: remove_filter_with_placeholders(node, consts={"query": query_consts,"select": consts, "filter": filter_consts}))
         tmp_query_algebra = traverse(tmp_query_algebra, disable_orderby_limit)
         tmp_query_algebra = traverse(tmp_query_algebra, disable_offset)
-        tmp_query_str = export_query(tmp_query_algebra, options, pretty=True)
+        tmp_query_str = export_query(tmp_query_algebra, options)
         
         # if not os.path.exists(tmp_query_result_file):              
         tmp_query_result = ctx.invoke(

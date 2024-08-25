@@ -30,14 +30,14 @@ def prerequisites(eval_config):
         eval_config (_type_): _description_
     """
     
-    app_config = load_config(eval_config)["evaluation"]["engines"]["fedx"]
-    app = app_config["dir"]
-    jar = os.path.join(app, "FedX-1.0-SNAPSHOT.jar")
-    lib = os.path.join(app, "lib/*")
+    config = load_config(eval_config)
+    engine_dir = config["evaluation"]["engines"]["fedx"]["dir"]
+    jar = os.path.join(engine_dir, "target", "FedX-1.0-SNAPSHOT.jar")
+    lib = os.path.join(engine_dir, "target", "lib/*")
     
     #if not os.path.exists(app) or not os.path.exists(jar) or os.path.exists(lib):
     oldcwd = os.getcwd()
-    os.chdir(Path(app).parent)
+    os.chdir(engine_dir)
     if os.system("mvn clean && mvn install dependency:copy-dependencies package") != 0:
         raise RuntimeError("Could not compile FedX")
     os.chdir(oldcwd)
@@ -45,25 +45,28 @@ def prerequisites(eval_config):
 def exec_fedx(eval_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec):
     config = load_config(eval_config)
     engine_dir = config["evaluation"]["engines"]["fedx"]["dir"]
-    engine_config = f"{engine_dir}/config/config_batch{batch_id}.ttl"
+    engine_config = f"target/config/config_batch{batch_id}.ttl"
     timeout = int(config["evaluation"]["timeout"])
     
     proxy_server = config["evaluation"]["proxy"]["endpoint"]
+    proxy_host = config["evaluation"]["proxy"]["host"]
+    proxy_port = config["evaluation"]["proxy"]["port"]
     
     # Reset the proxy stats
     if requests.get(proxy_server + "reset").status_code != 200:
         raise RuntimeError("Could not reset statistics on proxy!")
 
-    args = [engine_config, query, out_result, out_source_selection, query_plan, str(timeout), str(noexec).lower()]
+    args = [engine_config, query, out_result, out_source_selection, query_plan, str(timeout+10), str(noexec).lower()]
     args = " ".join(args)
-    #timeoutCmd = f'timeout --signal=SIGKILL {timeout}' if timeout != 0 else ""
-    timeoutCmd = ""
-    cmd = f'{timeoutCmd} mvn exec:java -Dexec.mainClass="org.example.FedX" -Dexec.args="{args}"'.strip()
+    timeoutCmd = f'timeout --signal=SIGKILL {timeout}' if timeout != 0 else ""
+    #timeoutCmd = ""
+    cmd = f'{timeoutCmd} mvn exec:java -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.example.FedX" -Dexec.args="{args}"'.strip()
 
     logger.debug("=== FedX ===")
     logger.debug(cmd)
     logger.debug("============")
-    
+
+    os.chdir(Path(engine_dir))
     fedx_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     failed_reason = None
     try:        
@@ -79,26 +82,26 @@ def exec_fedx(eval_config, query, out_result, out_source_selection, query_plan, 
         failed_reason = "timeout"
     finally:
         os.system('pkill -9 -f "FedX-1.0-SNAPSHOT.jar"')
-        #kill_process(fedx_proc.pid)
-        # Write stats
-        if stats != "/dev/null":            
-            # Write proxy stats
-            proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
-            
-            with open(f"{Path(stats).parent}/http_req.txt", "w") as http_req_fs:
-                http_req = proxy_stats["NB_HTTP_REQ"]
-                http_req_fs.write(str(http_req))
-                
-            with open(f"{Path(stats).parent}/ask.txt", "w") as http_ask_fs:
-                http_ask = proxy_stats["NB_ASK"]
-                http_ask_fs.write(str(http_ask))
-                
-            with open(f"{Path(stats).parent}/data_transfer.txt", "w") as data_transfer_fs:
-                data_transfer = proxy_stats["DATA_TRANSFER"]
-                data_transfer_fs.write(str(data_transfer))
+
+    # Write stats
+    if stats != "/dev/null":            
+        # Write proxy stats
+        proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
         
-            logger.info(f"Writing stats to {stats}")
-            create_stats(stats, failed_reason)
+        with open(f"{Path(stats).parent}/http_req.txt", "w") as http_req_fs:
+            http_req = proxy_stats["NB_HTTP_REQ"]
+            http_req_fs.write(str(http_req))
+            
+        with open(f"{Path(stats).parent}/ask.txt", "w") as http_ask_fs:
+            http_ask = proxy_stats["NB_ASK"]
+            http_ask_fs.write(str(http_ask))
+            
+        with open(f"{Path(stats).parent}/data_transfer.txt", "w") as data_transfer_fs:
+            data_transfer = proxy_stats["DATA_TRANSFER"]
+            data_transfer_fs.write(str(data_transfer))
+    
+        logger.info(f"Writing stats to {stats}")
+        create_stats(stats, failed_reason)
 
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
@@ -114,6 +117,13 @@ def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source
     Path(out_result).touch()
     Path(out_source_selection).touch()
     Path(query_plan).touch()
+
+    query = os.path.realpath(query)
+    out_result = os.path.realpath(out_result)
+    out_source_selection = os.path.realpath(out_source_selection)
+    query_plan = os.path.realpath(query_plan)
+    stats = os.path.realpath(stats)
+
     exec_fedx(eval_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec)
 
 @cli.command()
@@ -219,14 +229,24 @@ def transform_provenance(infile, outfile, prefix_cache):
 
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, dir_okay=False, file_okay=True))
-@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("batch_id", type=click.INT)
 @click.pass_context
-def generate_config_file(ctx: click.Context, eval_config, outfile, batch_id):
+def generate_config_file(ctx: click.Context, eval_config, batch_id):
     
     # Load config
     conf = load_config(eval_config)
-    proxy_mapping_file = conf["generation"]["virtuoso"]["proxy_mapping"]
+    proxy_mapping_file = os.path.realpath(
+        os.path.join(conf["generation"]["workdir"], f"virtuoso-proxy-mapping-batch{batch_id}.json")
+    )
+    
+    engine_dir = conf["evaluation"]["engines"]["fedx"]["dir"]   
+    
+    oldcwd = os.getcwd()
+    os.chdir(Path(engine_dir))  
+    logger.info(f"Generating endpoints file for batch {batch_id}...")
+
+    endpoints_file = f"target/config/config_batch{batch_id}.ttl"
+    Path(endpoints_file).parent.mkdir(parents=True, exist_ok=True)
 
     # Generate the endpoints file
     endpoints = {}
@@ -238,8 +258,8 @@ def generate_config_file(ctx: click.Context, eval_config, outfile, batch_id):
             endpoints[federation_member_iri] = target_endpoint
     
     update_required = False
-    if is_file_exists := os.path.exists(outfile):
-        with open(outfile) as f:
+    if is_file_exists := os.path.exists(endpoints_file):
+        with open(endpoints_file) as f:
             for endpoint in endpoints.values():
                 search_string = f'sd:endpoint "{endpoint}'
                 if update_required := search_string not in f.read():
@@ -247,11 +267,8 @@ def generate_config_file(ctx: click.Context, eval_config, outfile, batch_id):
                 
 
     if update_required or not is_file_exists:
-        
-        outfile = Path(outfile)
-        outfile.parent.mkdir(parents=True, exist_ok=True)
-        outfile.touch()
-        with outfile.open("w") as ffile:
+        Path(endpoints_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(endpoints_file, "w") as ffile:
             ffile.write(textwrap.dedent(
                 f"""
                 @prefix sd: <http://www.w3.org/ns/sparql-service-description#> .

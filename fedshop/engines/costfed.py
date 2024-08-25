@@ -82,8 +82,9 @@ def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source
     """
     
     config = load_config(eval_config)
-    app_config = config["evaluation"]["engines"]["costfed"]
-    app = app_config["dir"]
+    engine_dir = config["evaluation"]["engines"]["costfed"]["dir"]
+    proxy_host = config["evaluation"]["proxy"]["host"]
+    proxy_port = config["evaluation"]["proxy"]["port"]
     
     timeout = int(config["evaluation"]["timeout"])
     
@@ -102,13 +103,13 @@ def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source
     Path(out_source_selection).touch()
     Path(query_plan).touch()
 
-    cmd = f'mvn exec:java -Dhttp.proxyHost="localhost" -Dhttp.proxyPort="5555" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.aksw.simba.start.QueryEvaluation" -Dexec.args="costfed/costfed.props ../../{out_result} ../../{out_source_selection} ../../{query_plan} {timeout} {summary_file} ../../{query} {str(noexec).lower()} {endpoints_file}" -pl costfed'
+    cmd = f'mvn exec:java -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.aksw.simba.start.QueryEvaluation" -Dexec.args="costfed/costfed.props ../../{out_result} ../../{out_source_selection} ../../{query_plan} {timeout} {summary_file} ../../{query} {str(noexec).lower()} {endpoints_file}" -pl costfed'
 
     logger.debug("=== CostFed ===")
     logger.debug(cmd)
     logger.debug("============")
 
-    os.chdir(Path(app))
+    os.chdir(Path(engine_dir))
     costfed_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.chdir(oldcwd)
     
@@ -128,28 +129,29 @@ def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source
         failed_reason = "timeout"
     finally:
         os.system('pkill -9 -f "costfed/target"')
-        cache_file = f"{app}/cache.db"
+        cache_file = f"{engine_dir}/cache.db"
         Path(cache_file).unlink(missing_ok=True)
         #kill_process(fedx_proc.pid)     
         
-        if stats != "/dev/null":            
-            # Write proxy stats
-            proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
-            
-            with open(f"{Path(stats).parent}/http_req.txt", "w") as http_req_fs:
-                http_req = proxy_stats["NB_HTTP_REQ"]
-                http_req_fs.write(str(http_req))
-                
-            with open(f"{Path(stats).parent}/ask.txt", "w") as http_ask_fs:
-                http_ask = proxy_stats["NB_ASK"]
-                http_ask_fs.write(str(http_ask))
-                
-            with open(f"{Path(stats).parent}/data_transfer.txt", "w") as data_transfer_fs:
-                data_transfer = proxy_stats["DATA_TRANSFER"]
-                data_transfer_fs.write(str(data_transfer))
+    # Write proxy stats
+    if stats != "/dev/null":            
+        # Write proxy stats
+        proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
         
-            logger.info(f"Writing stats to {stats}")
-            create_stats(stats, failed_reason)   
+        with open(f"{Path(stats).parent}/http_req.txt", "w") as http_req_fs:
+            http_req = proxy_stats["NB_HTTP_REQ"]
+            http_req_fs.write(str(http_req))
+            
+        with open(f"{Path(stats).parent}/ask.txt", "w") as http_ask_fs:
+            http_ask = proxy_stats["NB_ASK"]
+            http_ask_fs.write(str(http_ask))
+            
+        with open(f"{Path(stats).parent}/data_transfer.txt", "w") as data_transfer_fs:
+            data_transfer = proxy_stats["DATA_TRANSFER"]
+            data_transfer_fs.write(str(data_transfer))
+    
+        logger.info(f"Writing stats to {stats}")
+        create_stats(stats, failed_reason)   
 
 @cli.command()
 @click.argument("infile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
@@ -309,24 +311,27 @@ def generate_config_file(ctx: click.Context, eval_config, batch_id):
     """
     
     # Load the config file
-    conf = load_config(eval_config)
-    proxy_mapping_file = conf["generation"]["virtuoso"]["proxy_mapping"]
-    proxy_mapping_file = os.path.realpath(proxy_mapping_file)
-    proxy_host = conf["evaluation"]["proxy"]["host"]
-    proxy_port = conf["evaluation"]["proxy"]["port"]
+    config = load_config(eval_config)
+    proxy_mapping_file = os.path.realpath(
+        os.path.join(config["generation"]["workdir"], f"virtuoso-proxy-mapping-batch{batch_id}.json")
+    )
+    proxy_host = config["evaluation"]["proxy"]["host"]
+    proxy_port = config["evaluation"]["proxy"]["port"]
     
     endpoints_file = f"summaries/endpoints_batch{batch_id}.txt"
     summary_file = f"summaries/sum_fedshop_batch{batch_id}.n3"     
-    engine_dir = conf["evaluation"]["engines"]["costfed"]["dir"]   
+    engine_dir = config["evaluation"]["engines"]["costfed"]["dir"]   
     
     oldcwd = os.getcwd()
     os.chdir(Path(engine_dir))  
+
+    Path("summaries").mkdir(parents=True, exist_ok=True)
     
     # Generate the endpoints file
     endpoints = []
     with open(endpoints_file, "w") as efs, open(proxy_mapping_file, "r") as pmfs:
         proxy_mapping = json.load(pmfs)
-        federation_members = conf["generation"]["virtuoso"]["federation_members"]
+        federation_members = config["generation"]["virtuoso"]["federation_members"]
         for federation_member_iri in federation_members[f"batch{batch_id}"].values():
             target_endpoint = proxy_mapping[federation_member_iri]
             endpoints.append(target_endpoint)
@@ -359,7 +364,10 @@ def generate_config_file(ctx: click.Context, eval_config, batch_id):
     
     # Modify costfed/costfed.props
     cmd = f'sed -Ei "s#quetzal\.fedSummaries=summaries/sum_fedshop_batch[0-9]+\.n3#quetzal.fedSummaries={summary_file}#g" costfed/costfed.props'
-    if os.system(cmd) != 0: raise RuntimeError("Could not modify costfed/costfed.props")
+    logger.debug(cmd)
+    proc = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    if proc.returncode != 0: raise RuntimeError("Could not modify costfed/costfed.props")
+    #if os.system(cmd) != 0: raise RuntimeError("Could not modify costfed/costfed.props")
     
     os.chdir(oldcwd)
 

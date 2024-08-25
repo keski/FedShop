@@ -1,6 +1,7 @@
 import ast
 import collections
 from itertools import chain
+import os
 from pprint import pprint
 import re
 from typing import (
@@ -14,7 +15,7 @@ import dateutil
 import pandas as pd
 from rdflib.plugins.sparql.parserutils import CompValue, Expr
 from rdflib.plugins.sparql.sparql import Query
-from rdflib.plugins.sparql.algebra import ExpressionNotCoveredException, traverse, _AlgebraTranslator, _traverseAgg, translateQuery
+from rdflib.plugins.sparql.algebra import ExpressionNotCoveredException, traverse, _traverseAgg, translateQuery
 from rdflib.term import Variable, Literal, URIRef
 
 
@@ -409,7 +410,7 @@ def add_service_to_triple_blocks(node, inline_data):
         return node                            
 
 # --------- MISC ------------
-class PrettyAlgebraTranslator(_AlgebraTranslator):
+def translateAlgebra(query_algebra):
     """
     Translator of a Query's algebra to its equivalent SPARQL (string).
 
@@ -427,24 +428,22 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
     referenced by client code at all in normal use.
     """
 
-    def __init__(self, query_algebra: Query, **kwargs):
-        self.query_algebra = query_algebra
-        self.aggr_vars: DefaultDict[
-            Identifier, List[Identifier]
-        ] = collections.defaultdict(list)
-        self._alg_translation: str = ""
-        self.__identation_level = 0
-        self.__identation_token = " " * int(kwargs.get("identation_n_space", 4))
-        self.__breakline_token = "\n"
+    def overwrite(text):
+        file = open("query.txt", "w+")
+        file.write(text)
+        file.close()
         
-    def _replace(
-        self,
+    def replace(
         old: str,
         new: str,
         search_from_match: str = None,
         search_from_match_occurrence: int = None,
         count: int = 1,
     ):  
+        # Read in the file
+        with open("query.txt", "r") as file:
+            filedata = file.read()
+
         def find_nth(haystack, needle, n):
             start = haystack.lower().find(needle)
             while start >= 0 and n > 1:
@@ -454,25 +453,31 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
 
         if search_from_match and search_from_match_occurrence:
             position = find_nth(
-                self._alg_translation, search_from_match, search_from_match_occurrence
+                filedata, search_from_match, search_from_match_occurrence
             )
-            filedata_pre = self._alg_translation[:position]
+            filedata_pre = filedata[:position]
             filedata_post = (
-                self._alg_translation[position:].replace(old, new, count)
+                filedata[position:].replace(old, new, count)
             )
-            self._alg_translation = filedata_pre + filedata_post
+            filedata = filedata_pre + filedata_post
         else:
-            self._alg_translation = (
-                self._alg_translation.replace(old, new, count)
-            )        
+            filedata = (
+                filedata.replace(old, new, count)
+            )  
+        
+        # Write the file out again
+        with open("query.txt", "w") as file:
+            file.write(filedata)
+
+    aggr_vars = collections.defaultdict(list)  # type: dict
 
     def convert_node_arg(
-        self, node_arg: typing.Union[Identifier, CompValue, Expr, str]
+        node_arg: typing.Union[Identifier, CompValue, Expr, str]
     ) -> str:
         if isinstance(node_arg, Identifier):
-            if node_arg in self.aggr_vars.keys():
+            if node_arg in aggr_vars.keys():
                 # type error: "Identifier" has no attribute "n3"
-                grp_var = self.aggr_vars[node_arg].pop(0).n3()  # type: ignore[attr-defined]
+                grp_var = aggr_vars[node_arg].pop(0).n3()  # type: ignore[attr-defined]
                 return grp_var
             else:
                 # type error: "Identifier" has no attribute "n3"
@@ -488,70 +493,74 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                 "The expression {0} might not be covered yet.".format(node_arg)
             )
 
-    def sparql_query_text(self, node):
+    def sparql_query_text(node):
         """
-         https://www.w3.org/TR/sparql11-query/#sparqlSyntax
+        https://www.w3.org/TR/sparql11-query/#sparqlSyntax
 
         :param node:
         :return:
         """
+
+        identation_level = 0
+        identation_token = " " * 4
+        breakline_token = "\n"
         
         if isinstance(node, CompValue):
-            identation = self.__identation_token * self.__identation_level 
-            next_level_identation = self.__identation_token * (self.__identation_level + 1)
+            identation = identation_token * identation_level 
+            next_level_identation = identation_token * (identation_level + 1)
                 
             # 18.2 Query Forms
             if node.name == "SelectQuery":
-                self._alg_translation = (
-                    identation + "-*-SELECT-*- " + "{" + node.p.name + "}" + self.__breakline_token +
-                    identation + self.__breakline_token
+                overwrite(
+                    identation + "-*-SELECT-*- " + "{" + node.p.name + "}" + breakline_token +
+                    identation + breakline_token
                 )
-                self.__identation_level += 1
+                identation_level += 1
                 
             # 18.2 Graph Patterns
             elif node.name == "BGP":
                 # Identifiers or Paths
                 # Negated path throws a type error. Probably n3() method of negated paths should be fixed
                 triples = (
-                    #identation + "{" + self.__breakline_token +
+                    #identation + "{" + breakline_token +
                     "".join(
-                        identation + triple[0].n3() + " " + triple[1].n3() + " " + triple[2].n3() + "." + self.__breakline_token
+                        identation + triple[0].n3() + " " + triple[1].n3() + " " + triple[2].n3() + "." + breakline_token
                         for triple in node.triples
                     )
-                    #+ identation + "} ." + self.__breakline_token
+                    #+ identation + "} ." + breakline_token
                 )
-                self._replace("{BGP}", triples)
+                replace("{BGP}", triples)
                 # The dummy -*-SELECT-*- is placed during a SelectQuery or Multiset pattern in order to be able
                 # to match extended variables in a specific Select-clause (see "Extend" below)
-                self._replace("-*-SELECT-*-", "SELECT", count=-1)
+                replace("-*-SELECT-*-", "SELECT", count=-1)
                 # If there is no "Group By" clause the placeholder will simply be deleted. Otherwise there will be
                 # no matching {GroupBy} placeholder because it has already been replaced by "group by variables"
-                self._replace("{GroupBy}", "", count=-1)
-                self._replace("{Having}", "", count=-1)
+                replace("{GroupBy}", "", count=-1)
+                replace("{Having}", "", count=-1)
             elif node.name == "Join":
-                self._replace(
+                replace(
                     "{Join}", (
-                        #identation + "{" + self.__breakline_token + 
-                        "{" + node.p1.name + "}" + self.__breakline_token + 
-                        #identation + "}" + "." + self.__breakline_token + 
+                        #identation + "{" + breakline_token + 
+                        "{" + node.p1.name + "}" + breakline_token + 
+                        #identation + "}" + "." + breakline_token + 
 
-                        #identation + "{" + self.__breakline_token + 
-                        "{" + node.p2.name + "}" + self.__breakline_token 
-                        #identation + "}" + self.__breakline_token
+                        #identation + "{" + breakline_token + 
+                        "{" + node.p2.name + "}" + breakline_token 
+                        #identation + "}" + breakline_token
                     )
                 )
-                #self.__identation_level += 1
+                #identation_level += 1
             elif node.name == "LeftJoin":
-                self._replace(
+                replace(
                     "{LeftJoin}",
                     (
-                        identation + "{" + node.p1.name + "}" + self.__breakline_token + 
-                        identation + "OPTIONAL" + "{" + self.__breakline_token + 
-                        identation + "{" + node.p2.name + "}" + self.__breakline_token +
-                        identation + "}" + self.__breakline_token
+                        identation + "{" + node.p1.name + "}" + breakline_token + 
+                        identation + "OPTIONAL" + "{" + breakline_token + 
+                        identation + "{" + node.p2.name + "}" + breakline_token +
+                        identation + "}" + breakline_token
                     ),
                 )
-                #self.__identation_level += 1
+                #identation_level += 1
             elif node.name == "Filter":
                 if isinstance(node.expr, CompValue):
                     expr = node.expr.name
@@ -562,64 +571,64 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                 if node.p:
                     # Filter with p=AggregateJoin = Having
                     if node.p.name == "AggregateJoin":
-                        self._replace(
+                        replace(
                             "{Filter}", 
                             (
-                                identation + self.__breakline_token + 
-                                identation + "{" + node.p.name + "}" + self.__breakline_token
+                                identation + breakline_token + 
+                                identation + "{" + node.p.name + "}" + breakline_token
                             )
                         )
-                        self._replace(
+                        replace(
                             "{Having}", 
                             (
-                                identation + "HAVING({" + expr + "})" + self.__breakline_token
+                                identation + "HAVING({" + expr + "})" + breakline_token
                             )
                         )
                     else:
-                        self._replace(
+                        replace(
                             "{Filter}", 
                             (
-                                identation + "FILTER({" + expr + "})" + self.__breakline_token + 
-                                "{" + node.p.name +  "}" + self.__breakline_token
+                                identation + "FILTER({" + expr + "})" + breakline_token + 
+                                "{" + node.p.name +  "}" + breakline_token
                             )
                         )
                 else:
-                    self._replace(
+                    replace(
                         "{Filter}", 
-                        identation + "FILTER({" + expr + "})" + self.__breakline_token
+                        identation + "FILTER({" + expr + "})" + breakline_token
                     )
 
             elif node.name == "Union":
-                self._replace(
+                replace(
                     "{Union}", (
-                        identation + "{" + self.__breakline_token +
-                        next_level_identation + "{" + node.p1.name + "}" + self.__breakline_token + 
-                        identation + "} UNION {" + self.__breakline_token +
-                        next_level_identation + "{" + node.p2.name + "}" + self.__breakline_token + 
-                        identation + "}" + self.__breakline_token
+                        identation + "{" + breakline_token +
+                        next_level_identation + "{" + node.p1.name + "}" + breakline_token + 
+                        identation + "} UNION {" + breakline_token +
+                        next_level_identation + "{" + node.p2.name + "}" + breakline_token + 
+                        identation + "}" + breakline_token
                     )
                 )
             elif node.name == "Graph":
                 expr = (
-                    identation + "GRAPH " + node.term.n3() + " {" + self.__breakline_token + 
-                    next_level_identation + "{" + node.p.name + "}" + self.__breakline_token + 
-                    identation + "}" + self.__breakline_token
+                    identation + "GRAPH " + node.term.n3() + " {" + breakline_token + 
+                    next_level_identation + "{" + node.p.name + "}" + breakline_token + 
+                    identation + "}" + breakline_token
                 )
-                self._replace("{Graph}", expr)
+                replace("{Graph}", expr)
             elif node.name == "Extend":
-                query_string = self._alg_translation.lower()
+                query_string = open("query.txt", "r").read().lower()
                 select_occurrences = query_string.count("-*-select-*-")
-                self._replace(
+                replace(
                     node.var.n3(),
                     "("
-                    + self.convert_node_arg(node.expr)
+                    + convert_node_arg(node.expr)
                     + " as "
                     + node.var.n3()
                     + ")",
                     search_from_match="-*-select-*-",
                     search_from_match_occurrence=select_occurrences,
                 )
-                self._replace(
+                replace(
                     "{Extend}", 
                     (
                         identation + "{" + node.p.name + "}"
@@ -627,12 +636,12 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                 )
             elif node.name == "Minus":
                 expr = (
-                    next_level_identation + "{" + node.p1.name + "}" + self.__breakline_token +
-                    identation + "} MINUS {" + self.__breakline_token + 
-                    next_level_identation + "{" + node.p2.name + "}" + self.__breakline_token +
-                    identation + "}" + self.__breakline_token
+                    next_level_identation + "{" + node.p1.name + "}" + breakline_token +
+                    identation + "} MINUS {" + breakline_token + 
+                    next_level_identation + "{" + node.p2.name + "}" + breakline_token +
+                    identation + "}" + breakline_token
                 )
-                self._replace("{Minus}", expr)
+                replace("{Minus}", expr)
             elif node.name == "Group":
                 group_by_vars = []
                 if node.expr:
@@ -643,24 +652,24 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                             raise ExpressionNotCoveredException(
                                 "This expression might not be covered yet."
                             )
-                    self._replace(
+                    replace(
                         "{Group}", 
                         (
                             "{" + node.p.name + "}" 
                         )
                     )
-                    self._replace(
+                    replace(
                         "{GroupBy}", "GROUP BY " + " ".join(group_by_vars) + " "
                     )
                 else:
-                    self._replace(
+                    replace(
                         "{Group}", 
                         (
                             "{" + node.p.name + "}" 
                         )
                     )
             elif node.name == "AggregateJoin":
-                self._replace(
+                replace(
                     "{AggregateJoin}", 
                     (
                         "{" + node.p.name + "}" 
@@ -673,14 +682,14 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                         raise ExpressionNotCoveredException(
                             "This expression might not be covered yet."
                         )
-                    self.aggr_vars[agg_func.res].append(agg_func.vars)
+                    aggr_vars[agg_func.res].append(agg_func.vars)
 
                     agg_func_name = agg_func.name.split("_")[1]
                     distinct = ""
                     if agg_func.distinct:
                         distinct = agg_func.distinct + " "
                     if agg_func_name == "GroupConcat":
-                        self._replace(
+                        replace(
                             identifier,
                             "GROUP_CONCAT"
                             + "("
@@ -691,44 +700,44 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                             + ")",
                         )
                     else:
-                        self._replace(
+                        replace(
                             identifier,
                             agg_func_name.upper()
                             + "("
                             + distinct
-                            + self.convert_node_arg(agg_func.vars)
+                            + convert_node_arg(agg_func.vars)
                             + ")",
                         )
                     # For non-aggregated variables the aggregation function "sample" is automatically assigned.
                     # However, we do not want to have "sample" wrapped around non-aggregated variables. That is
                     # why we replace it. If "sample" is used on purpose it will not be replaced as the alias
                     # must be different from the variable in this case.
-                    self._replace(
+                    replace(
                         "(SAMPLE({0}) as {0})".format(
-                            self.convert_node_arg(agg_func.vars)
+                            convert_node_arg(agg_func.vars)
                         ),
-                        self.convert_node_arg(agg_func.vars),
+                        convert_node_arg(agg_func.vars),
                     )
             elif node.name == "GroupGraphPatternSub":
-                self._replace(
+                replace(
                     "GroupGraphPatternSub",
                     (
-                        identation + "{" + self.__breakline_token +
+                        identation + "{" + breakline_token +
                         "".join([
-                            next_level_identation + self.convert_node_arg(pattern) 
+                            next_level_identation + convert_node_arg(pattern) 
                             for pattern in node.part
                         ]) +
-                        identation + "}" + self.__breakline_token
+                        identation + "}" + breakline_token
                     ),
                 )
-                self.__identation_level += 1
+                identation_level += 1
                 
             elif node.name == "TriplesBlock":
                 print("triplesblock")
-                self._replace(
+                replace(
                     "{TriplesBlock}",
                     (
-                        # identation + "{" + self.__breakline_token +
+                        # identation + "{" + breakline_token +
                         "".join(
                             identation
                             + triple[0].n3()
@@ -737,10 +746,10 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                             + " "
                             + triple[2].n3()
                             + "."
-                            + self.__breakline_token
+                            + breakline_token
                             for triple in node.triples
                         )
-                        # + identation + "} ." + self.__breakline_token
+                        # + identation + "} ." + breakline_token
                     ),
                 )
 
@@ -765,7 +774,7 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                             function_expr = c.expr.expr
                             if isinstance(function_expr, list):
                                 function_expr = ", ".join(
-                                    self.convert_node_arg(expr) for expr in function_expr
+                                    convert_node_arg(expr) for expr in function_expr
                                 )
                             function_str = f"{function_iri}({function_expr})"
                             order_conditions.append(function_str)
@@ -777,8 +786,8 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                         raise ExpressionNotCoveredException(
                             "This expression might not be covered yet."
                         )
-                self._replace("{OrderBy}", "{" + node.p.name + "}")
-                self._replace("{OrderConditions}", " ".join(order_conditions) + " ")
+                replace("{OrderBy}", "{" + node.p.name + "}")
+                replace("{OrderConditions}", " ".join(order_conditions) + " ")
             elif node.name == "Project":
                 project_variables = []
                 for var in node.PV:
@@ -791,43 +800,43 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                 order_by_pattern = ""
                 if node.p.name == "OrderBy":
                     order_by_pattern = "ORDER BY {OrderConditions}"
-                self._replace(
+                replace(
                     "{Project}",
                     " ".join(project_variables) + " "
-                    + "{" + self.__breakline_token
-                    + "{" + node.p.name + "}" + self.__breakline_token
-                    + "}" + self.__breakline_token
-                    + "{GroupBy}" + self.__breakline_token
-                    + order_by_pattern + self.__breakline_token
-                    + "{Having}" + self.__breakline_token,
+                    + "{" + breakline_token
+                    + "{" + node.p.name + "}" + breakline_token
+                    + "}" + breakline_token
+                    + "{GroupBy}" + breakline_token
+                    + order_by_pattern + breakline_token
+                    + "{Having}" + breakline_token,
                 )
             elif node.name == "Distinct":
-                self._replace("{Distinct}", "DISTINCT {" + node.p.name + "}")
+                replace("{Distinct}", "DISTINCT {" + node.p.name + "}")
             elif node.name == "Reduced":
-                self._replace("{Reduced}", "REDUCED {" + node.p.name + "}")
+                replace("{Reduced}", "REDUCED {" + node.p.name + "}")
             elif node.name == "Slice":
                 slice = "OFFSET " + str(node.start) + " LIMIT " + str(node.length)
-                self._replace(
+                replace(
                     "{Slice}", 
                     "{" + node.p.name + "}" + slice
                 )
             elif node.name == "ToMultiSet":
                 if node.p.name == "values":
-                    self._replace(
+                    replace(
                         "{ToMultiSet}", 
                         (
-                            #identation + "{" + self.__breakline_token +
-                            next_level_identation + "{" + node.p.name + "}" + self.__breakline_token 
-                            #identation + "}" + self.__breakline_token
+                            #identation + "{" + breakline_token +
+                            next_level_identation + "{" + node.p.name + "}" + breakline_token 
+                            #identation + "}" + breakline_token
                         )
                     )
                 else:
-                    self._replace(
+                    replace(
                         "{ToMultiSet}", 
                         (
-                            #identation + "{" + self.__breakline_token + 
-                            next_level_identation + "-*-SELECT-*- " + "{" + node.p.name + "}" + self.__breakline_token
-                            #identation + "}" + self.__breakline_token
+                            #identation + "{" + breakline_token + 
+                            next_level_identation + "-*-SELECT-*- " + "{" + node.p.name + "}" + breakline_token
+                            #identation + "}" + breakline_token
                         )
                     )
 
@@ -836,73 +845,73 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
             # 17 Expressions and Testing Values
             # # 17.3 Operator Mapping
             elif node.name == "RelationalExpression":
-                expr = self.convert_node_arg(node.expr)
+                expr = convert_node_arg(node.expr)
                 op = node.op
                 if isinstance(list, type(node.other)):
                     other = (
                         "("
-                        + ", ".join(self.convert_node_arg(expr) for expr in node.other)
+                        + ", ".join(convert_node_arg(expr) for expr in node.other)
                         + ")"
                     )
                 else:
-                    other = self.convert_node_arg(node.other)
+                    other = convert_node_arg(node.other)
                 condition = "{left} {operator} {right}".format(
                     left=expr, operator=op, right=other
                 )
-                self._replace("{RelationalExpression}", condition)
+                replace("{RelationalExpression}", condition)
             elif node.name == "ConditionalAndExpression":
                 inner_nodes = " && ".join(
-                    [self.convert_node_arg(expr) for expr in node.other]
+                    [convert_node_arg(expr) for expr in node.other]
                 )
-                self._replace(
+                replace(
                     "{ConditionalAndExpression}",
-                    self.convert_node_arg(node.expr) + " && " + inner_nodes,
+                    convert_node_arg(node.expr) + " && " + inner_nodes,
                 )
             elif node.name == "ConditionalOrExpression":
                 inner_nodes = " || ".join(
-                    [self.convert_node_arg(expr) for expr in node.other]
+                    [convert_node_arg(expr) for expr in node.other]
                 )
-                self._replace(
+                replace(
                     "{ConditionalOrExpression}",
-                    "(" + self.convert_node_arg(node.expr) + " || " + inner_nodes + ")",
+                    "(" + convert_node_arg(node.expr) + " || " + inner_nodes + ")",
                 )
             elif node.name == "MultiplicativeExpression":
-                left_side = self.convert_node_arg(node.expr)
+                left_side = convert_node_arg(node.expr)
                 multiplication = left_side
                 for i, operator in enumerate(node.op):  # noqa: F402
                     multiplication += (
-                        " " + operator + " " + self.convert_node_arg(node.other[i]) + " "
+                        " " + operator + " " + convert_node_arg(node.other[i]) + " "
                     )
-                self._replace("{MultiplicativeExpression}", multiplication)
+                replace("{MultiplicativeExpression}", multiplication)
             elif node.name == "AdditiveExpression":
-                left_side = self.convert_node_arg(node.expr)
+                left_side = convert_node_arg(node.expr)
                 addition = left_side
                 for i, operator in enumerate(node.op):
                     addition += (
-                        " " + operator + " " + self.convert_node_arg(node.other[i]) + " "
+                        " " + operator + " " + convert_node_arg(node.other[i]) + " "
                     )
-                self._replace("{AdditiveExpression}", addition)
+                replace("{AdditiveExpression}", addition)
             elif node.name == "UnaryNot":
-                self._replace("{UnaryNot}", "!" + self.convert_node_arg(node.expr))
+                replace("{UnaryNot}", "!" + convert_node_arg(node.expr))
 
             # # 17.4 Function Definitions
             # # # 17.4.1 Functional Forms
             elif node.name.endswith("BOUND"):
-                bound_var = self.convert_node_arg(node.arg)
-                self._replace("{Builtin_BOUND}", "bound(" + bound_var + ")")
+                bound_var = convert_node_arg(node.arg)
+                replace("{Builtin_BOUND}", "bound(" + bound_var + ")")
             elif node.name.endswith("IF"):
-                arg2 = self.convert_node_arg(node.arg2)
-                arg3 = self.convert_node_arg(node.arg3)
+                arg2 = convert_node_arg(node.arg2)
+                arg3 = convert_node_arg(node.arg3)
 
                 if_expression = (
                     "IF(" + "{" + node.arg1.name + "}, " + arg2 + ", " + arg3 + ")"
                 )
-                self._replace("{Builtin_IF}", if_expression)
+                replace("{Builtin_IF}", if_expression)
             elif node.name.endswith("COALESCE"):
-                self._replace(
+                replace(
                     "{Builtin_COALESCE}",
                     "COALESCE("
-                    + ", ".join(self.convert_node_arg(arg) for arg in node.arg)
+                    + ", ".join(convert_node_arg(arg) for arg in node.arg)
                     + ")",
                 )
             elif node.name.endswith("Builtin_EXISTS"):
@@ -910,15 +919,15 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                 # According to https://www.w3.org/TR/2013/REC-sparql11-query-20130321/#rExistsFunc
                 # ExistsFunc can only have a GroupGraphPattern as parameter. However, when we print the query algebra
                 # we get a GroupGraphPatternSub
-                self._replace(
+                replace(
                     "{Builtin_EXISTS}", 
                     (
-                        identation + "EXISTS " + "{{" + self.__breakline_token +
-                        next_level_identation + node.graph.name + self.__breakline_token + 
-                        identation + "}}" + self.__breakline_token
+                        identation + "EXISTS " + "{{" + breakline_token +
+                        next_level_identation + node.graph.name + breakline_token + 
+                        identation + "}}" + breakline_token
                     )
                 )
-                traverse(node.graph, visitPre=self.sparql_query_text)
+                traverse(node.graph, visitPre=sparql_query_text)
                 return node.graph
             elif node.name.endswith("Builtin_NOTEXISTS"):
                 # The node's name which we get with node.graph.name returns "Join" instead of GroupGraphPatternSub
@@ -926,26 +935,26 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                 # NotExistsFunc can only have a GroupGraphPattern as parameter. However, when we print the query algebra
                 # we get a GroupGraphPatternSub
                 print(node.graph.name)
-                self._replace(
+                replace(
                     "{Builtin_NOTEXISTS}", 
                     (
-                        identation + "NOT EXISTS " + "{{" + self.__breakline_token +
-                        next_level_identation + node.graph.name + self.__breakline_token + 
-                        identation + "}}" + self.__breakline_token
+                        identation + "NOT EXISTS " + "{{" + breakline_token +
+                        next_level_identation + node.graph.name + breakline_token + 
+                        identation + "}}" + breakline_token
                     )
                 )
-                traverse(node.graph, visitPre=self.sparql_query_text)
+                traverse(node.graph, visitPre=sparql_query_text)
                 return node.graph
             # # # # 17.4.1.5 logical-or: Covered in "RelationalExpression"
             # # # # 17.4.1.6 logical-and: Covered in "RelationalExpression"
             # # # # 17.4.1.7 RDFterm-equal: Covered in "RelationalExpression"
             elif node.name.endswith("sameTerm"):
-                self._replace(
+                replace(
                     "{Builtin_sameTerm}",
                     "SAMETERM("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             # # # # IN: Covered in "RelationalExpression"
@@ -953,253 +962,253 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
 
             # # # 17.4.2 Functions on RDF Terms
             elif node.name.endswith("Builtin_isIRI"):
-                self._replace(
-                    "{Builtin_isIRI}", "isIRI(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_isIRI}", "isIRI(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name.endswith("Builtin_isBLANK"):
-                self._replace(
+                replace(
                     "{Builtin_isBLANK}",
-                    "isBLANK(" + self.convert_node_arg(node.arg) + ")",
+                    "isBLANK(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name.endswith("Builtin_isLITERAL"):
-                self._replace(
+                replace(
                     "{Builtin_isLITERAL}",
-                    "isLITERAL(" + self.convert_node_arg(node.arg) + ")",
+                    "isLITERAL(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name.endswith("Builtin_isNUMERIC"):
-                self._replace(
+                replace(
                     "{Builtin_isNUMERIC}",
-                    "isNUMERIC(" + self.convert_node_arg(node.arg) + ")",
+                    "isNUMERIC(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name.endswith("Builtin_STR"):
-                self._replace(
-                    "{Builtin_STR}", "STR(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_STR}", "STR(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name.endswith("Builtin_LANG"):
-                self._replace(
-                    "{Builtin_LANG}", "LANG(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_LANG}", "LANG(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name.endswith("Builtin_DATATYPE"):
-                self._replace(
+                replace(
                     "{Builtin_DATATYPE}",
-                    "DATATYPE(" + self.convert_node_arg(node.arg) + ")",
+                    "DATATYPE(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name.endswith("Builtin_IRI"):
-                self._replace(
-                    "{Builtin_IRI}", "IRI(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_IRI}", "IRI(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name.endswith("Builtin_BNODE"):
-                self._replace(
-                    "{Builtin_BNODE}", "BNODE(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_BNODE}", "BNODE(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name.endswith("STRDT"):
-                self._replace(
+                replace(
                     "{Builtin_STRDT}",
                     "STRDT("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("Builtin_STRLANG"):
-                self._replace(
+                replace(
                     "{Builtin_STRLANG}",
                     "STRLANG("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("Builtin_UUID"):
-                self._replace("{Builtin_UUID}", "UUID()")
+                replace("{Builtin_UUID}", "UUID()")
             elif node.name.endswith("Builtin_STRUUID"):
-                self._replace("{Builtin_STRUUID}", "STRUUID()")
+                replace("{Builtin_STRUUID}", "STRUUID()")
 
             # # # 17.4.3 Functions on Strings
             elif node.name.endswith("Builtin_STRLEN"):
-                self._replace(
+                replace(
                     "{Builtin_STRLEN}",
-                    "STRLEN(" + self.convert_node_arg(node.arg) + ")",
+                    "STRLEN(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name.endswith("Builtin_SUBSTR"):
-                args = [self.convert_node_arg(node.arg), node.start]
+                args = [convert_node_arg(node.arg), node.start]
                 if node.length:
                     args.append(node.length)
                 expr = "SUBSTR(" + ", ".join(args) + ")"
-                self._replace("{Builtin_SUBSTR}", expr)
+                replace("{Builtin_SUBSTR}", expr)
             elif node.name.endswith("Builtin_UCASE"):
-                self._replace(
-                    "{Builtin_UCASE}", "UCASE(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_UCASE}", "UCASE(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name.endswith("Builtin_LCASE"):
-                self._replace(
-                    "{Builtin_LCASE}", "LCASE(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_LCASE}", "LCASE(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name.endswith("Builtin_STRSTARTS"):
-                self._replace(
+                replace(
                     "{Builtin_STRSTARTS}",
                     "STRSTARTS("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("Builtin_STRENDS"):
-                self._replace(
+                replace(
                     "{Builtin_STRENDS}",
                     "STRENDS("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("Builtin_CONTAINS"):
-                self._replace(
+                replace(
                     "{Builtin_CONTAINS}",
                     "CONTAINS("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("Builtin_STRBEFORE"):
-                self._replace(
+                replace(
                     "{Builtin_STRBEFORE}",
                     "STRBEFORE("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("Builtin_STRAFTER"):
-                self._replace(
+                replace(
                     "{Builtin_STRAFTER}",
                     "STRAFTER("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("Builtin_ENCODE_FOR_URI"):
-                self._replace(
+                replace(
                     "{Builtin_ENCODE_FOR_URI}",
-                    "ENCODE_FOR_URI(" + self.convert_node_arg(node.arg) + ")",
+                    "ENCODE_FOR_URI(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name.endswith("Builtin_CONCAT"):
                 expr = "CONCAT({vars})".format(
-                    vars=", ".join(self.convert_node_arg(elem) for elem in node.arg)
+                    vars=", ".join(convert_node_arg(elem) for elem in node.arg)
                 )
-                self._replace("{Builtin_CONCAT}", expr)
+                replace("{Builtin_CONCAT}", expr)
             elif node.name.endswith("Builtin_LANGMATCHES"):
-                self._replace(
+                replace(
                     "{Builtin_LANGMATCHES}",
                     "LANGMATCHES("
-                    + self.convert_node_arg(node.arg1)
+                    + convert_node_arg(node.arg1)
                     + ", "
-                    + self.convert_node_arg(node.arg2)
+                    + convert_node_arg(node.arg2)
                     + ")",
                 )
             elif node.name.endswith("REGEX"):
                 args = [
-                    self.convert_node_arg(node.text),
-                    self.convert_node_arg(node.pattern),
+                    convert_node_arg(node.text),
+                    convert_node_arg(node.pattern),
                 ]
                 expr = "REGEX(" + ", ".join(args) + ")"
-                self._replace("{Builtin_REGEX}", expr)
+                replace("{Builtin_REGEX}", expr)
             elif node.name.endswith("REPLACE"):
-                self._replace(
-                    "{Builtin_REPLACE}",
+                replace(
+                    "{Builtinreplace}",
                     "REPLACE("
-                    + self.convert_node_arg(node.arg)
+                    + convert_node_arg(node.arg)
                     + ", "
-                    + self.convert_node_arg(node.pattern)
+                    + convert_node_arg(node.pattern)
                     + ", "
-                    + self.convert_node_arg(node.replacement)
+                    + convert_node_arg(node.replacement)
                     + ")",
                 )
 
             # # # 17.4.4 Functions on Numerics
             elif node.name == "Builtin_ABS":
-                self._replace(
-                    "{Builtin_ABS}", "ABS(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_ABS}", "ABS(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_ROUND":
-                self._replace(
-                    "{Builtin_ROUND}", "ROUND(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_ROUND}", "ROUND(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_CEIL":
-                self._replace(
-                    "{Builtin_CEIL}", "CEIL(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_CEIL}", "CEIL(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_FLOOR":
-                self._replace(
-                    "{Builtin_FLOOR}", "FLOOR(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_FLOOR}", "FLOOR(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_RAND":
-                self._replace("{Builtin_RAND}", "RAND()")
+                replace("{Builtin_RAND}", "RAND()")
 
             # # # 17.4.5 Functions on Dates and Times
             elif node.name == "Builtin_NOW":
-                self._replace("{Builtin_NOW}", "NOW()")
+                replace("{Builtin_NOW}", "NOW()")
             elif node.name == "Builtin_YEAR":
-                self._replace(
-                    "{Builtin_YEAR}", "YEAR(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_YEAR}", "YEAR(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_MONTH":
-                self._replace(
-                    "{Builtin_MONTH}", "MONTH(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_MONTH}", "MONTH(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_DAY":
-                self._replace(
-                    "{Builtin_DAY}", "DAY(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_DAY}", "DAY(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_HOURS":
-                self._replace(
-                    "{Builtin_HOURS}", "HOURS(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_HOURS}", "HOURS(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_MINUTES":
-                self._replace(
+                replace(
                     "{Builtin_MINUTES}",
-                    "MINUTES(" + self.convert_node_arg(node.arg) + ")",
+                    "MINUTES(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name == "Builtin_SECONDS":
-                self._replace(
+                replace(
                     "{Builtin_SECONDS}",
-                    "SECONDS(" + self.convert_node_arg(node.arg) + ")",
+                    "SECONDS(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name == "Builtin_TIMEZONE":
-                self._replace(
+                replace(
                     "{Builtin_TIMEZONE}",
-                    "TIMEZONE(" + self.convert_node_arg(node.arg) + ")",
+                    "TIMEZONE(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name == "Builtin_TZ":
-                self._replace(
-                    "{Builtin_TZ}", "TZ(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_TZ}", "TZ(" + convert_node_arg(node.arg) + ")"
                 )
 
             # # # 17.4.6 Hash functions
             elif node.name == "Builtin_MD5":
-                self._replace(
-                    "{Builtin_MD5}", "MD5(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_MD5}", "MD5(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_SHA1":
-                self._replace(
-                    "{Builtin_SHA1}", "SHA1(" + self.convert_node_arg(node.arg) + ")"
+                replace(
+                    "{Builtin_SHA1}", "SHA1(" + convert_node_arg(node.arg) + ")"
                 )
             elif node.name == "Builtin_SHA256":
-                self._replace(
+                replace(
                     "{Builtin_SHA256}",
-                    "SHA256(" + self.convert_node_arg(node.arg) + ")",
+                    "SHA256(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name == "Builtin_SHA384":
-                self._replace(
+                replace(
                     "{Builtin_SHA384}",
-                    "SHA384(" + self.convert_node_arg(node.arg) + ")",
+                    "SHA384(" + convert_node_arg(node.arg) + ")",
                 )
             elif node.name == "Builtin_SHA512":
-                self._replace(
+                replace(
                     "{Builtin_SHA512}",
-                    "SHA512(" + self.convert_node_arg(node.arg) + ")",
+                    "SHA512(" + convert_node_arg(node.arg) + ")",
                 )
 
             # Other
@@ -1230,42 +1239,32 @@ class PrettyAlgebraTranslator(_AlgebraTranslator):
                                     term
                                 )
                             )
-                    rows += identation + "(" + " ".join(row) + ")" + self.__breakline_token
+                    rows += identation + "(" + " ".join(row) + ")" + breakline_token
 
-                self._replace(
+                replace(
                     "{values}", 
                     (
-                        identation + values + "{" + self.__breakline_token + 
-                        next_level_identation + rows + self.__breakline_token + 
-                        identation + "}" + self.__breakline_token 
+                        identation + values + "{" + breakline_token + 
+                        next_level_identation + rows + breakline_token + 
+                        identation + "}" + breakline_token 
                     )
                 )
             elif node.name == "ServiceGraphPattern":
-                self._replace(
+                replace(
                     "{ServiceGraphPattern}",
                     (
-                        identation + "SERVICE " + self.convert_node_arg(node.term) + self.__breakline_token +
+                        identation + "SERVICE " + convert_node_arg(node.term) + breakline_token +
                         "{" + node.graph.name + "}"
                     )
                 )
-                traverse(node.graph, visitPre=self.sparql_query_text)
+                traverse(node.graph, visitPre=sparql_query_text)
                 return node.graph
             
             # else:
             #     raise ExpressionNotCoveredException("The expression {0} might not be covered yet.".format(node.name))
-
-    def translateAlgebra(self) -> str:
-        traverse(self.query_algebra.algebra, visitPre=self.sparql_query_text)
-        return self._alg_translation
     
-def translateAlgebra(query_algebra: Query, pretty=False) -> str:
-    """
-    Translates a SPARQL 1.1 algebra tree into the corresponding query string.
+    traverse(query_algebra.algebra, visitPre=sparql_query_text)
+    query_from_algebra = open("query.txt", "r").read()
+    os.remove("query.txt")
 
-    :param query_algebra: An algebra returned by `translateQuery`.
-    :return: The query form generated from the SPARQL 1.1 algebra tree for
-        SELECT queries.
-    """
-    if pretty:
-        return PrettyAlgebraTranslator(query_algebra=query_algebra).translateAlgebra()
-    return _AlgebraTranslator(query_algebra=query_algebra).translateAlgebra()
+    return query_from_algebra
