@@ -134,7 +134,7 @@ rule execute_instances:
                 LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
                 time.sleep(1)
 
-        composition_file = f"{Path(str(input)).parent}/decomposition.json"
+        composition_file = f"{Path(str(input)).parent}/composition.json"
         if not os.path.exists(composition_file):
             shell("python fedshop/query.py decompose-query {input} {composition_file}")
         shell("python fedshop/query.py execute-query {params.endpoint_batch0} --queryfile={input} --outfile={output}")

@@ -472,8 +472,8 @@ def decompose_query(ctx: click.Context, queryfile, outfile):
             if node.name == "pname":
                 return f'{node["prefix"]}:{node["localname"]}'
         elif hasattr(node, "n3"):
-            return node.n3()
-        
+            return str(node)
+    
         return children[0] if isinstance(children, list) and len(children) > 0 else children
     
     def visit_add_triple(node, children):

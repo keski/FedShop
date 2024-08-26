@@ -156,9 +156,9 @@ rule transform_provenance:
     input: "{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/source_selection.txt"
     output: "{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/provenance.csv"
     params:
-        prefix_cache=expand("{workDir}/benchmark/generation/{{query}}/instance_{{instance_id}}/prefix_cache.json", workDir=WORK_DIR)
+        composition=expand("{workDir}/benchmark/generation/{{query}}/instance_{{instance_id}}/composition.json", workDir=WORK_DIR)
     run: 
-        shell("python fedshop/engines/{wildcards.engine}.py transform-provenance {input} {output} {params.prefix_cache}")
+        shell("python fedshop/engines/{wildcards.engine}.py transform-provenance {input} {output} {params.composition}")
 
 rule transform_results:
     input: "{benchDir}/{engine}/{query}/instance_{instance_id}/batch_{batch_id}/attempt_{attempt_id}/results.txt"
@@ -216,6 +216,7 @@ rule evaluate_engines:
                 while not ping(SPARQL_DEFAULT_ENDPOINT):
                     LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
                     time.sleep(1)
+
             if not docker_check_container_running(PROXY_CONTAINER_NAME):
                 shell(f'docker compose -f {PROXY_COMPOSE_FILE} stop')
                 shell(f"docker start {PROXY_CONTAINER_NAME}")

@@ -154,8 +154,8 @@ def transform_results(infile, outfile):
 @cli.command()
 @click.argument("infile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
-@click.argument("prefix-cache", type=click.Path(exists=False, file_okay=True, dir_okay=False))
-def transform_provenance(infile, outfile, prefix_cache):
+@click.argument("composition-file", type=click.Path(exists=False, file_okay=True, dir_okay=False))
+def transform_provenance(infile, outfile, composition_file):
     
     with open(infile, "r") as ifs:
         if len(ifs.read().strip()) == 0:
@@ -167,25 +167,11 @@ def transform_provenance(infile, outfile, prefix_cache):
         fedx_pattern = r"StatementPattern\s+(\(new scope\)\s+)?Var\s+\((name=\w+,\s+value=(.*),\s+anonymous|name=(\w+))\)\s+Var\s+\((name=\w+,\s+value=(.*),\s+anonymous|name=(\w+))\)\s+Var\s+\((name=\w+,\s+value=(.*),\s+anonymous|name=(\w+))\)"
         match = re.match(fedx_pattern, x)
         
-        s = match.group(3)
-        if s is None: s = f"?{match.group(4)}"
-        
-        p = match.group(6)
-        if p is None: p = f"?{match.group(7)}"
-        
-        o = match.group(9) 
-        if o is None: o = f"?{match.group(10)}"
+        s = match.group(3) or match.group(4)
+        p = match.group(6) or match.group(7)
+        o = match.group(9) or match.group(10)
         
         result = " ".join([s, p, o])
-                
-        for prefix, alias in prefix2alias.items():
-            result = result.replace(prefix, f"{alias}:")
-            
-        if s.startswith("http"):
-            result = result.replace(s, str2n3(s))
-            
-        if o.startswith("http"):
-            result = result.replace(o, str2n3(o))
         
         return result
 
@@ -206,8 +192,7 @@ def transform_provenance(infile, outfile, prefix_cache):
     
     in_df = pd.read_csv(infile)
         
-    with open(prefix_cache, "r") as prefix_cache_fs, open(os.path.join(Path(prefix_cache).parent, "composition.json"), "r") as comp_fs:
-        prefix2alias = json.load(prefix_cache_fs)    
+    with open(composition_file, "r") as comp_fs:
         composition = json.load(comp_fs)
         inv_composition = {f"{' '.join(v)}": k for k, v in composition.items()}
                         
@@ -219,7 +204,7 @@ def transform_provenance(infile, outfile, prefix_cache):
 
         # If unequal length (as in union, optional), fill with nan
         max_length = in_df["source_selection"].apply(len).max()
-        in_df["source_selection"] = in_df["source_selection"].apply(pad)
+        #in_df["source_selection"] = in_df["source_selection"].apply(pad)
                 
         out_df = in_df.set_index("tp_name")["source_selection"] \
             .to_frame().T \
@@ -283,7 +268,7 @@ def generate_config_file(ctx: click.Context, eval_config, batch_id):
                     <{graph_uri}> a sd:Service ;
                         fedx:store "SPARQLEndpoint";
                         sd:endpoint "{endpoint}";
-                        fedx:supportsASKQueries false .   
+                        fedx:supportsASKQueries true .   
 
                     """
                 ))
