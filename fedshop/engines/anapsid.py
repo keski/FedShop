@@ -18,7 +18,7 @@ from sklearn.calibration import LabelEncoder
 import sys
 sys.path.append(str(os.path.join(Path(__file__).parent.parent)))
 
-from utils import check_container_status, kill_process, load_config, fedshop_logger, create_stats, str2n3
+from utils import kill_process, load_config, fedshop_logger, create_stats, str2n3
 import fedx
 
 logger = fedshop_logger(Path(__file__).name)
@@ -49,13 +49,22 @@ def prerequisites(ctx: click.Context, eval_config):
     
     old_dir = os.getcwd()
     os.chdir(app_dir)
-    if os.system("rm -rf build && python setup.py install") != 0:
+
+    # Check if Python version is 2.7
+    python2_bin = shutil.which("python2").replace("shims", "versions/2.7.18/bin")
+    if python2_bin is None:
+        raise RuntimeError("Python 2.7 is required to run ANAPSID.")
+    
+    pip2_bin = f"{python2_bin} -m pip"
+    
+    cmd = f"rm -rf build && {pip2_bin} install -r requirements.txt --no-cache --force-reinstall && {pip2_bin} install . --no-cache --force-reinstall"
+    print(cmd)
+    if os.system(cmd) != 0:
         raise RuntimeError("Could not compile ANAPSID")
     os.chdir(old_dir)
 
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
-@click.argument("engine-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.argument("query", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.option("--out-result", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--out-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
@@ -64,7 +73,7 @@ def prerequisites(ctx: click.Context, eval_config):
 @click.option("--batch-id", type=click.INT, default=-1)
 @click.option("--noexec", is_flag=True, default=False)
 @click.pass_context
-def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec):
+def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source_selection, query_plan, stats, batch_id, noexec):
     """Execute the workload instance then its associated source selection query.
     
     Expected output:
@@ -92,24 +101,7 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
         create_stats(stats)
         return
         
-    in_query_file = f"{Path(out_result).parent}/injected.sparql"
-    
-    with    open(query, "r") as qfs, \
-            open(in_query_file, "w") as in_qfs, \
-            open(f"{Path(query).parent}/prefix_cache.json", "r") as prefix_cache_fs \
-    :
-        query_text = qfs.read()
-        prefix_cache = json.load(prefix_cache_fs)
-        prefix_cache_inv = {v: k for k, v in prefix_cache.items()}
-        for alias, prefix in prefix_cache_inv.items():
-            query_text = re.sub(re.escape(alias)+":", str2n3(prefix), query_text)
-                    
-        for line in query_text.splitlines(keepends=True):
-            if line.strip().startswith("#") or line.strip().startswith("PREFIX"):
-                continue
-            
-            in_qfs.write(re.sub(r">(\w+)", r"\1>", line))
-    
+    summary_file = f"summaries/sum_fedshop_batch{batch_id}.txt"
     config = load_config(eval_config)
     app_dir = config["evaluation"]["engines"]["anapsid"]["dir"]
     compose_file = config["generation"]["virtuoso"]["compose_file"]
@@ -123,7 +115,12 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
     if requests.get(proxy_server + "reset").status_code != 200:
         raise RuntimeError("Could not reset statistics on proxy!")
 
-    cmd = f"python scripts/run_anapsid -e ../../{engine_config} -q ../../{in_query_file} -p naive -s False -o False -d SSGM -a True -r ../../{out_result} -z ../../{Path(stats).parent}/ask.txt -y ../../{Path(stats).parent}/planning_time.txt -x ../../{query_plan} -v ../../{out_source_selection} -u ../../{Path(stats).parent}/source_selection_time.txt -n ../../{Path(stats).parent}/exec_time.txt -c {str(noexec)}"
+    python2_bin = shutil.which("python2").replace("shims", "versions/2.7.18/bin")
+    if python2_bin is None:
+        raise RuntimeError("Python 2.7 is required to run ANAPSID.")
+    
+    timeoutCmd = f'timeout --signal=SIGKILL {timeout}' if timeout != 0 else ""
+    cmd = f"{timeoutCmd} {python2_bin} scripts/run_anapsid -e {summary_file} -q ../../{query} -p naive -s False -o False -d SSGM -a True -r ../../{out_result} -z ../../{Path(stats).parent}/ask.txt -y ../../{Path(stats).parent}/planning_time.txt -x ../../{query_plan} -v ../../{out_source_selection} -u ../../{Path(stats).parent}/source_selection_time.txt -n ../../{Path(stats).parent}/exec_time.txt -c {str(noexec)}"
 
     print("=== ANAPSID ===")
     print(cmd)
@@ -173,9 +170,6 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
                 failed_reason = "error_runtime"
     except subprocess.TimeoutExpired: 
         logger.exception(f"{query} timed out!")
-        if (container_status := check_container_status(compose_file, service_name, container_name)) != "running":
-            logger.debug(container_status)
-            #raise RuntimeError("Backend is terminated!")
         logger.info("Writing empty stats...")
         failed_reason = "timeout"
 
@@ -183,24 +177,24 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
         #kill_process(anapsid_proc.pid)
         os.system('pkill -9 -f "scripts/run_anapsid"')
         
-        if stats != "/dev/null":            
-            # Write proxy stats
-            proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
-            
-            with open(f"{Path(stats).parent}/http_req.txt", "w") as http_req_fs:
-                http_req = proxy_stats["NB_HTTP_REQ"]
-                http_req_fs.write(str(http_req))
-                
-            with open(f"{Path(stats).parent}/ask.txt", "w") as http_ask_fs:
-                http_ask = proxy_stats["NB_ASK"]
-                http_ask_fs.write(str(http_ask))
-                
-            with open(f"{Path(stats).parent}/data_transfer.txt", "w") as data_transfer_fs:
-                data_transfer = proxy_stats["DATA_TRANSFER"]
-                data_transfer_fs.write(str(data_transfer))
+    if stats != "/dev/null":            
+        # Write proxy stats
+        proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
         
-            logger.info(f"Writing stats to {stats}")
-            create_stats(stats, failed_reason)   
+        with open(f"{Path(stats).parent}/http_req.txt", "w") as http_req_fs:
+            http_req = proxy_stats["NB_HTTP_REQ"]
+            http_req_fs.write(str(http_req))
+            
+        with open(f"{Path(stats).parent}/ask.txt", "w") as http_ask_fs:
+            http_ask = proxy_stats["NB_ASK"]
+            http_ask_fs.write(str(http_ask))
+            
+        with open(f"{Path(stats).parent}/data_transfer.txt", "w") as data_transfer_fs:
+            data_transfer = proxy_stats["DATA_TRANSFER"]
+            data_transfer_fs.write(str(data_transfer))
+    
+        logger.info(f"Writing stats to {stats}")
+        create_stats(stats, failed_reason)   
 
 @cli.command()
 @click.argument("infile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
@@ -318,13 +312,10 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
     os.remove(tmp_outfile)
 
 @cli.command()
-@click.argument("datafiles", type=click.Path(exists=True, dir_okay=False, file_okay=True), nargs=-1)
-@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("eval-config", type=click.Path(exists=True, dir_okay=False, file_okay=True))
 @click.argument("batch_id", type=click.INT)
-@click.argument("endpoint", type=str)
 @click.pass_context
-def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, batch_id, endpoint):
+def generate_config_file(ctx: click.Context, eval_config, batch_id):
     """Generate the config file for the engine
 
     Args:
@@ -334,54 +325,56 @@ def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, ba
         endpoint (_type_): _description_
     """
 
+    # Load the config file
     config = load_config(eval_config)
-    app_dir = config["evaluation"]["engines"]["anapsid"]["dir"]
+    proxy_mapping_file = os.path.realpath(
+        os.path.join(config["generation"]["workdir"], f"virtuoso-proxy-mapping-batch{batch_id}.json")
+    )
     
-    old_dir = os.getcwd()
+    endpoints_file = f"summaries/endpoints_batch{batch_id}.txt"
+    summary_file = f"summaries/sum_fedshop_batch{batch_id}.txt"     
+    engine_dir = config["evaluation"]["engines"]["anapsid"]["dir"]   
     
-    ssite = set()
-    
-    endpoints=f"{Path(outfile).parent}/endpoints.txt"
-    
-    if not Path(endpoints).exists():
-        Path.mkdir(Path(endpoints).parent, parents=True, exist_ok=True)
-        for data_file in datafiles:
-            with open(data_file, "r") as file, open(endpoints, "w") as efs:
-                t_file = file.readlines()
-                for line in t_file:
-                    site = line.rsplit()[-2]
-                    site = re.search(r"<(.*)>", site).group(1)
-                    ssite.add(site)
-                efs.write("\n".join(ssite))
+    oldcwd = os.getcwd()
+    logger.debug(f"Switching to {engine_dir}...")
+    os.chdir(Path(engine_dir))  
+
+    Path("summaries").mkdir(parents=True, exist_ok=True)
+            
+    # Generate the endpoints file
+    endpoints = []
+    with open(endpoints_file, "w") as efs, open(proxy_mapping_file, "r") as pmfs:
+        proxy_mapping = json.load(pmfs)
+        federation_members = config["generation"]["virtuoso"]["federation_members"]
+        for federation_member_iri in federation_members[f"batch{batch_id}"].values():
+            target_endpoint = proxy_mapping[federation_member_iri]
+            endpoints.append(target_endpoint)
+            efs.write(f"{target_endpoint}\n")
+
+    update_required = False       
+    if not os.path.exists(summary_file):
+        update_required = True
     else:
-        with open(endpoints, "r") as efs:
-            ssite = set([x.strip() for x in efs.readlines()])
-         
-    update = False       
-    if not os.path.exists(outfile):
-        update = True
-    else:
-        with open(outfile, "r") as ofs:
+        with open(summary_file, "r") as ofs:
             content = ofs.read()
-            for source in ssite:
+            for source in endpoints:
                 if source not in content:
-                    update = True
-                    logger.debug(f"{source} not in {outfile}")
+                    update_required = True
+                    logger.debug(f"{source} not in {summary_file}")
                     break
         
-    if update:             
-        Path(outfile).parent.mkdir(parents=True, exist_ok=True)
-        tmp_outfile = f"{outfile}.tmp"
-        with open(tmp_outfile, "w") as config_fs:
-            for s in sorted(ssite):
-                config_fs.write(f"{endpoint}/?default-graph-uri={s}\n")
+    if update_required:             
+        Path(summary_file).parent.mkdir(parents=True, exist_ok=True)
+        tmp_summaryfile = f"{summary_file}.tmp"
+        with open(tmp_summaryfile, "w") as config_fs:
+            for s in sorted(endpoints):
+                config_fs.write(f"{s}\n")
 
-        os.chdir(app_dir)
-        cmd = f"python scripts/get_predicates ../../{tmp_outfile} ../../{outfile}"
+        cmd = f"python scripts/get_predicates {tmp_summaryfile} {summary_file}"
         logger.debug(cmd)
+        os.remove(tmp_summaryfile)
         os.system(cmd)
-        os.chdir(old_dir)
-        os.remove(tmp_outfile)
+        os.chdir(oldcwd)
 
 if __name__ == "__main__":
     cli()

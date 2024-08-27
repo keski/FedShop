@@ -103,7 +103,8 @@ def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source
     Path(out_source_selection).touch()
     Path(query_plan).touch()
 
-    cmd = f'mvn exec:java -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.aksw.simba.start.QueryEvaluation" -Dexec.args="costfed/costfed.props ../../{out_result} ../../{out_source_selection} ../../{query_plan} {timeout} {summary_file} ../../{query} {str(noexec).lower()} {endpoints_file}" -pl costfed'
+    timeoutCmd = f'timeout --signal=SIGKILL {timeout}' if timeout != 0 else ""
+    cmd = f'{timeoutCmd} mvn exec:java -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.aksw.simba.start.QueryEvaluation" -Dexec.args="costfed/costfed.props ../../{out_result} ../../{out_source_selection} ../../{query_plan} {timeout+10} {summary_file} ../../{query} {str(noexec).lower()} {endpoints_file}" -pl costfed'
 
     logger.debug("=== CostFed ===")
     logger.debug(cmd)

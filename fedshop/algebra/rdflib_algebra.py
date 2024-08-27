@@ -512,7 +512,7 @@ def translateAlgebra(query_algebra):
             # 18.2 Query Forms
             if node.name == "SelectQuery":
                 overwrite(
-                    identation + "-*-SELECT-*- " + "{" + node.p.name + "}" + breakline_token +
+                    identation + "-*-SELECT-*- WHERE " + "{" + node.p.name + "}" + breakline_token +
                     identation + breakline_token
                 )
                 identation_level += 1
@@ -835,7 +835,7 @@ def translateAlgebra(query_algebra):
                         "{ToMultiSet}", 
                         (
                             #identation + "{" + breakline_token + 
-                            next_level_identation + "-*-SELECT-*- " + "{" + node.p.name + "}" + breakline_token
+                            next_level_identation + "-*-SELECT-*- WHERE " + "{" + node.p.name + "}" + breakline_token
                             #identation + "}" + breakline_token
                         )
                     )
