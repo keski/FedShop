@@ -220,26 +220,11 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
         fedx_pattern = r"{StatementPattern\s+?Var\s+\((name=\w+;\s+value=(.*);\s+anonymous|name=(\w+))\)\s+Var\s+\((name=\w+;\s+value=(.*);\s+anonymous|name=(\w+))\)\s+Var\s+\((name=\w+;\s+value=(.*);\s+anonymous|name=(\w+))\)"
         match = re.match(fedx_pattern, x)
         
-        s = match.group(2)
-        if s is None: s = f"?{match.group(3)}"
-        
-        p = match.group(5)
-        if p is None: p = f"?{match.group(6)}"
-        
-        o = match.group(8) 
-        if o is None: o = f"?{match.group(9)}"
+        s = match.group(2) or match.group(3)
+        p = match.group(5) or match.group(6)
+        o = match.group(8) or match.group(9)
         
         result = " ".join([s, p, o])
-                
-        for prefix, alias in prefix2alias.items():
-            result = result.replace(prefix, f"{alias}:")
-            
-        if s.startswith("http"):
-            result = result.replace(s, str2n3(s))
-            
-        if o.startswith("http"):
-            result = result.replace(o, str2n3(o))
-        
         return result
 
     def extract_source_selection(x):
@@ -281,7 +266,7 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
 
             # If unequal length (as in union, optional), fill with nan
             max_length = in_df[f"source_selection{key}"].apply(len).max()
-            in_df[f"source_selection{key}"] = in_df[f"source_selection{key}"].apply(pad)
+            #in_df[f"source_selection{key}"] = in_df[f"source_selection{key}"].apply(pad)
             
             if str(key) == "Result #0":
                 out_df = in_df.set_index(f"tp_name{key}")[f"source_selection{key}"] \
@@ -315,14 +300,13 @@ def generate_config_file(ctx: click.Context, eval_config, batch_id):
     proxy_mapping_file = os.path.realpath(
         os.path.join(config["generation"]["workdir"], f"virtuoso-proxy-mapping-batch{batch_id}.json")
     )
-    proxy_host = config["evaluation"]["proxy"]["host"]
-    proxy_port = config["evaluation"]["proxy"]["port"]
     
     endpoints_file = f"summaries/endpoints_batch{batch_id}.txt"
     summary_file = f"summaries/sum_fedshop_batch{batch_id}.n3"     
     engine_dir = config["evaluation"]["engines"]["costfed"]["dir"]   
     
     oldcwd = os.getcwd()
+    logger.debug(f"Switching to {engine_dir}...")
     os.chdir(Path(engine_dir))  
 
     Path("summaries").mkdir(parents=True, exist_ok=True)
@@ -339,6 +323,7 @@ def generate_config_file(ctx: click.Context, eval_config, batch_id):
     
     # Generate summary      
     require_update = False 
+    logger.debug(f"Checking {summary_file}...")
     if os.path.exists(summary_file):
         if os.stat(summary_file).st_size == 0:
             logger.debug("{summary_file} is empty! Regenerating...")
@@ -351,11 +336,13 @@ def generate_config_file(ctx: click.Context, eval_config, batch_id):
                         logger.debug(f"{endpoint} not found in {summary_file}")
                         require_update = True
                         break
+    else:
+        require_update = True
 
     if require_update:
         try:
             logger.info(f"Generating summary for batch {batch_id}")
-            cmd = f'mvn exec:java -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -Dexec.mainClass="org.aksw.simba.quetsal.util.TBSSSummariesGenerator" -Dexec.args="{summary_file} {endpoints_file}" -pl costfed'
+            cmd = f'mvn exec:java -Dexec.mainClass="org.aksw.simba.quetsal.util.TBSSSummariesGenerator" -Dexec.args="{summary_file} {endpoints_file}" -pl costfed'
             logger.debug(cmd)
             proc = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
             if proc.returncode != 0: raise RuntimeError(f"Could not generate {summary_file}")
