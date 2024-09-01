@@ -39,7 +39,16 @@ def prerequisites(ctx: click.Context, eval_config):
     Args:
         eval_config (_type_): _description_
     """
-    pass
+    config = load_config(eval_config)
+    app_dir = config["evaluation"]["engines"]["mulder"]["dir"]
+    
+    old_dir = os.getcwd()
+    os.chdir(app_dir)
+
+    cmd = "pip install -r requirements.txt --no-cache --force-reinstall"
+    if os.system(cmd) != 0:
+        raise RuntimeError("Could not compile MULDER!")
+    os.chdir(old_dir)
 
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))

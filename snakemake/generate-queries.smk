@@ -160,9 +160,10 @@ rule create_workload_value_selection:
         n_query_instances = N_QUERY_INSTANCES,
     run:
         SPARQL_CONTAINER_NAME = f"docker-{SPARQL_SERVICE_NAME}-1"
-        if USE_DOCKER and not docker_check_container_running(SPARQL_CONTAINER_NAME):
-            shell(f'docker compose -f {SPARQL_COMPOSE_FILE} stop')
-            shell(f"docker start {SPARQL_CONTAINER_NAME}")
+        if USE_DOCKER :
+            if not docker_check_container_running(SPARQL_CONTAINER_NAME):
+                shell(f'docker compose -f {SPARQL_COMPOSE_FILE} stop')
+                shell(f"docker start {SPARQL_CONTAINER_NAME}")
             while not ping(SPARQL_DEFAULT_ENDPOINT):
                 LOGGER.debug(f"Waiting for {SPARQL_DEFAULT_ENDPOINT} to start...")
                 time.sleep(1)

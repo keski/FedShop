@@ -13,11 +13,13 @@ import numpy as np
 from pathlib import Path
 import requests
 from sklearn.preprocessing import LabelEncoder
+from rdflib import ConjunctiveGraph
 
 import sys
 sys.path.append(str(os.path.join(Path(__file__).parent.parent)))
 
-from utils import check_container_status, load_config, fedshop_logger, str2n3, create_stats, create_stats
+from query import execute_query
+from utils import load_config, fedshop_logger, str2n3, create_stats, create_stats
 import fedx
 
 logger = fedshop_logger(Path(__file__).name)
@@ -46,10 +48,13 @@ def prerequisites(ctx: click.Context, eval_config):
     
     #if not os.path.exists(app) or not os.path.exists(jar) or os.path.exists(lib):
     oldcwd = os.getcwd()
+
     
     for build_loc in [Path(app_config["dir"]).absolute(), Path(app_config["summary_generator_dir"]).absolute()]:
-        os.chdir(build_loc)        
-        if os.system("mvn clean && mvn install dependency:copy-dependencies package -Dmaven.test.skip=true") != 0:
+        os.chdir(build_loc)   
+        java_version = subprocess.check_output("jenv version", shell=True).decode().split()[0]
+        java_home = f"{os.environ['HOME']}/.jenv/versions/{java_version}"
+        if os.system(f"mvn clean && JAVA_HOME={java_home} mvn install dependency:copy-dependencies package -Dmaven.test.skip=true") != 0:
             raise RuntimeError(f"Could not compile {build_loc}")
         
     # os.chdir(Path(app_config["summary_generator_dir"]).absolute() + "/assembly/target/")
@@ -58,7 +63,6 @@ def prerequisites(ctx: click.Context, eval_config):
 
 @cli.command()
 @click.argument("eval-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
-@click.argument("engine-config", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.argument("query", type=click.Path(exists=True, file_okay=True, dir_okay=True))
 @click.option("--out-result", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
 @click.option("--out-source-selection", type=click.Path(exists=False, file_okay=True, dir_okay=True), default="/dev/null")
@@ -68,7 +72,7 @@ def prerequisites(ctx: click.Context, eval_config):
 @click.option("--batch-id", type=click.INT, default=-1)
 @click.option("--noexec", is_flag=True, default=False)
 @click.pass_context
-def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_result, out_source_selection, query_plan, stats, force_source_selection, batch_id, noexec):
+def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source_selection, query_plan, stats, force_source_selection, batch_id, noexec):
     """Execute the workload instance then its associated source selection query.
     
     Expected output:
@@ -79,7 +83,6 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
     Args:
         ctx (click.Context): _description_
         eval_config (_type_): _description_
-        engine_config (_type_): _description_
         query (_type_): _description_
         out_result (_type_): _description_
         out_source_selection (_type_): _description_
@@ -92,43 +95,41 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
     config = load_config(eval_config)
     app_config = config["evaluation"]["engines"]["semagrow"]
     app = app_config["dir"]
-    last_batch = int(config["generation"]["n_batch"]) - 1
     
-    compose_file = config["generation"]["virtuoso"]["compose_file"]
-    service_name = config["generation"]["virtuoso"]["service_name"]
-    container_name = config["generation"]["virtuoso"]["container_names"][last_batch]
     timeout = int(config["evaluation"]["timeout"])
     
-    oldcwd = os.getcwd()
-    summary_file = f"metadata-sparql-{batch_id}.ttl"   
+    summary_file = f"summaries/metadata-fedshop-batch{batch_id}.ttl"   
+    repo_file = f"summaries/repo-fedshop-batch{batch_id}.ttl"
     
+    proxy_host = config["evaluation"]["proxy"]["host"]
+    proxy_port = config["evaluation"]["proxy"]["port"]
     proxy_server = config["evaluation"]["proxy"]["endpoint"]
-    proxy_sparql_endpoint = proxy_server + "sparql"
     
     # Reset the proxy stats
     if requests.get(proxy_server + "reset").status_code != 200:
         raise RuntimeError("Could not reset statistics on proxy!")
     
-    # Prepare args for semagrow
-    Path(out_result).touch()
-    Path(out_source_selection).touch()
-    Path(query_plan).touch()
-    out_result = f"{Path(out_result).with_suffix('.csv')}"
-    
-    cmd = f"./semagrow.sh repository.ttl {proxy_sparql_endpoint} ../../../{out_result} ../../../{out_source_selection} ../../../{query_plan} {timeout} ../../../{query} {out_result.split('/')[7].split('_')[1]} false true {summary_file} {str(noexec).lower()}"
+    #cmd = f"./semagrow.sh "
+    out_result = os.path.realpath(out_result)
+    out_source_selection = os.path.realpath(out_source_selection)
+    query_plan = os.path.realpath(query_plan)
+    query = os.path.realpath(query)
+
+    tmp_results_file = Path(out_result).with_suffix('.csv')
+    noexec = "--noexec" if noexec else ""
+    timeout_cmd = f'timeout --signal=SIGKILL {timeout}' if timeout != 0 else ""
+    cmd = f'{timeout_cmd} mvn exec:java -Dhttp.proxyHost="{proxy_host}" -Dhttp.proxyPort="{proxy_port}" -Dhttp.nonProxyHosts="" -pl "rdf4j/" -Dexec.mainClass="org.semagrow.cli.CliMain" -Dexec.args="--query {query} --output {tmp_results_file} --config {repo_file} --metadata {summary_file} {noexec}"'
 
     logger.debug("=== Semagrow ===")
     logger.debug(cmd)
     logger.debug("============")
 
     os.chdir(Path(app))
-    
-    if not os.path.exists(f"metadata-sparql-{batch_id}_dump.ttl"):
-        logger.info(f"Dump file does not exist, creating once...")
-        timeout = 300
+
+    shutil.copy(repo_file, "repository.ttl")
+    shutil.copy(summary_file, "metadata.ttl")
         
-    semagrow_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    os.chdir(oldcwd)
+    semagrow_proc = subprocess.Popen(cmd.strip(), shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     failed_reason = None
     
@@ -137,7 +138,7 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
         if semagrow_proc.returncode == 0:
             logger.info(f"{query} benchmarked sucessfully")
             
-            shutil.copy(out_result, Path(out_result).with_suffix('.txt'))
+            shutil.copy(tmp_results_file, out_result)
 
             try: 
                 results_df = pd.read_csv(out_result).replace("null", None)
@@ -156,15 +157,7 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
             failed_reason = "error_runtime"
             
     except subprocess.TimeoutExpired: 
-        logger.exception(f"{query} timed out!")
-        if (container_status := check_container_status(compose_file, service_name, container_name)) != "running":
-            logger.debug(container_status)
-            raise RuntimeError("Backend is terminated!")
-        
-        # Counter-measure for issue #41 (https://github.com/mhoangvslev/FedShop/issues/41)
-        if psutil.virtual_memory().percent >= 60:
-            os.system(f"docker stop {container_name}")
-        
+        logger.exception(f"{query} timed out!")        
         failed_reason = "timeout"
         
     finally:
@@ -172,25 +165,29 @@ def run_benchmark(ctx: click.Context, eval_config, engine_config, query, out_res
         #cache_file = f"{app}/cache.db"
         #Path(cache_file).unlink(missing_ok=True)
         #kill_process(fedx_proc.pid)    
+    
+    # Write stats
+    if stats != "/dev/null":            
+        # Write proxy stats
+        proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
+
+        stats_home = Path(stats).parent
+        Path(stats_home).mkdir(parents=True, exist_ok=True)
         
-        if stats != "/dev/null":            
-            # Write proxy stats
-            proxy_stats = json.loads(requests.get(proxy_server + "get-stats").text)
+        with open(f"{stats_home}/http_req.txt", "w") as http_req_fs:
+            http_req = proxy_stats["NB_HTTP_REQ"]
+            http_req_fs.write(str(http_req))
             
-            with open(f"{Path(stats).parent}/http_req.txt", "w") as http_req_fs:
-                http_req = proxy_stats["NB_HTTP_REQ"]
-                http_req_fs.write(str(http_req))
-                
-            with open(f"{Path(stats).parent}/ask.txt", "w") as http_ask_fs:
-                http_ask = proxy_stats["NB_ASK"]
-                http_ask_fs.write(str(http_ask))
-                
-            with open(f"{Path(stats).parent}/data_transfer.txt", "w") as data_transfer_fs:
-                data_transfer = proxy_stats["DATA_TRANSFER"]
-                data_transfer_fs.write(str(data_transfer))
-        
-            logger.info(f"Writing stats to {stats}")
-            create_stats(stats, failed_reason) 
+        with open(f"{stats_home}/ask.txt", "w") as http_ask_fs:
+            http_ask = proxy_stats["NB_ASK"]
+            http_ask_fs.write(str(http_ask))
+            
+        with open(f"{stats_home}/data_transfer.txt", "w") as data_transfer_fs:
+            data_transfer = proxy_stats["DATA_TRANSFER"]
+            data_transfer_fs.write(str(data_transfer))
+    
+        logger.info(f"Writing stats to {stats}")
+        create_stats(stats, failed_reason) 
         
 
 @cli.command()
@@ -309,13 +306,10 @@ def transform_provenance(ctx: click.Context, infile, outfile, prefix_cache):
         out_df.to_csv(outfile, index=False)
         
 @cli.command()
-@click.argument("datafiles", type=click.Path(exists=True, dir_okay=False, file_okay=True), nargs=-1)
-@click.argument("outfile", type=click.Path(exists=False, file_okay=True, dir_okay=False))
 @click.argument("eval-config", type=click.Path(exists=True, dir_okay=False, file_okay=True))
 @click.argument("batch_id", type=click.INT)
-@click.argument("endpoint", type=str)
 @click.pass_context
-def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, batch_id, endpoint):
+def generate_config_file(ctx: click.Context, eval_config, batch_id):
     """Generate the config file for the engine
 
     Args:
@@ -324,21 +318,33 @@ def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, ba
         outfile (_type_): _description_
         endpoint (_type_): _description_
     """
+
+    # Load the config file
+    config = load_config(eval_config)
+    proxy_mapping_file = os.path.realpath(
+        os.path.join(config["generation"]["workdir"], f"virtuoso-proxy-mapping-batch{batch_id}.json")
+    )
+      
+    engine_dir = config["evaluation"]["engines"]["semagrow"]["dir"]
+    summary_generator_dir = config["evaluation"]["engines"]["semagrow"]["summary_generator_dir"]
+
+    summary_file = os.path.realpath(os.path.join(engine_dir, f"summaries/metadata-fedshop-batch{batch_id}.ttl"))
+    repo_file = os.path.realpath(os.path.join(engine_dir, f"summaries/repo-fedshop-batch{batch_id}.ttl"))
+
+    default_endpoint = config["generation"]["virtuoso"]["default_endpoint"]
     
-    summary_file = f"metadata-sparql-{batch_id}.ttl"     
-    app_config = load_config(eval_config)["evaluation"]["engines"]["semagrow"]
-    app = app_config["dir"]  
+    Path(summary_file).parent.mkdir(parents=True, exist_ok=True)
+    can_create_repo = False
     
-    Path(outfile).parent.mkdir(parents=True, exist_ok=True)
-    can_create_repo = not os.path.exists(outfile)
-    
-    if not can_create_repo:
-        with open(outfile, "r") as f:
+    if os.path.exists(repo_file):
+        with open(repo_file, "r") as f:
             repo_txt = f.read()
-            can_create_repo = can_create_repo or (summary_file in repo_txt)
+            can_create_repo = summary_file not in repo_txt
+    else:
+        can_create_repo = True
 
     if can_create_repo:
-        with open(outfile, "w") as repo:
+        with open(repo_file, "w") as repo:
             repo.write("################################################################################\n")
             repo.write("# Sesame configuration for SemaGrow\n")
             repo.write("#\n")
@@ -365,39 +371,41 @@ def generate_config_file(ctx: click.Context, datafiles, outfile, eval_config, ba
             repo.write("\t] .")
     
     oldcwd = os.getcwd()
-    os.chdir(Path(app))   
+    os.chdir(Path(summary_generator_dir))   
+        
+    proxy_mapping = {}
+    with open(proxy_mapping_file, "r") as pmfs:
+        proxy_mapping = json.load(pmfs)
     
-    shutil.copy(f"../../../{outfile}", "repository.ttl")
-    
-    update_summary = not os.path.exists(summary_file)
-    # if not update_summary:
-    #     with open(summary_file, "r") as sfs:
-    #         summary_text = sfs.read()
-    #         for datafile in datafiles:
-    #             with open(f"../../../{datafile}", "r") as file:
-    #                 line = file.readline()
-    #                 source = line.rsplit()[-2]
-    #                 if source not in summary_text:
-    #                     logger.debug(f"{source} not in {summary_file}")
-    #                     update_summary = True
-    #                     break
-    
-    sources = set()
-    for datafile in datafiles:
-        with open(f"../../../{datafile}", "r") as file:
-            line = file.readline()
-            source = line.rsplit()[-2]
-            sources.add(source)
+    endpoints = list(proxy_mapping.values())
+        
+    update_summary = False
+
+    if os.path.exists(summary_file):
+        with open(summary_file, "r") as f:
+            summary_txt = f.read()
+            update_summary = not all([endpoint in summary_txt for endpoint in endpoints])
+    else:
+        update_summary = True
 
     if update_summary:
-        try:
+
+        summary_graph = ConjunctiveGraph()
+
+        for i, (graph, endpoint) in enumerate(proxy_mapping.items()):
             logger.info(f"Generating summary for batch {batch_id}")
-            cmd = f'mvn -q exec:java -pl "cli/" -Dexec.mainClass="org.semagrow.sevod.scraper.cli.Main" -Dexec.args="--sparql --input {endpoint} --graph={",".join(sources)} --output {summary_file}"'                  
-            # cmd = f"./semagrow.sh repository.ttl {endpoint} ignore ignore ignore ignore ignore {batch_id} true false {summary_file}"
+            tmp_summary_file = f"tmp{i}.ttl"
+            cmd = f'mvn -q exec:java -pl "cli/" -Dexec.mainClass="org.semagrow.sevod.scraper.cli.Main" -Dexec.args="--sparql --input {endpoint} --output {tmp_summary_file}"'                  
             logger.debug(cmd)
-            if os.system(cmd) != 0: raise RuntimeError(f"Could not generate {summary_file}")
-        except InterruptedError:
-            Path(summary_file).unlink(missing_ok=True)
+            if os.system(cmd) != 0: raise RuntimeError(f"Could not generate {tmp_summary_file}")
+
+            if os.system(f'sed -i "s|_:DatasetRoot|<http://example.org/DatasetRoot>|g" {tmp_summary_file}') != 0: raise RuntimeError()
+            if os.system(f'sed -i "s|_:Dataset1|<http://example.org/Dataset{i}>|g" {tmp_summary_file}') != 0: raise RuntimeError()
+
+            summary_graph.parse(tmp_summary_file, format="turtle")
+            os.remove(tmp_summary_file)
+        
+        summary_graph.serialize(destination=summary_file, format="turtle")
     
     os.chdir(oldcwd)
 

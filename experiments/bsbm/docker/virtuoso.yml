@@ -1,6 +1,6 @@
 services:
   bsbm-virtuoso:
-    image: openlink/virtuoso-opensource-7:7.2.12-alpine
+    image: openlink/virtuoso-opensource-7:7.2.13-alpine
     #container_name: docker-bsbm-virtuoso-1
     environment:
       SPARQL_UPDATE: "false"

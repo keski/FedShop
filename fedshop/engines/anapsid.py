@@ -119,8 +119,9 @@ def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source
     if python2_bin is None:
         raise RuntimeError("Python 2.7 is required to run ANAPSID.")
     
+    environment_settings = f'HTTP_PROXY={proxy_server} HTTPS_PROXY={proxy_server} NO_PROXY=""'
     timeoutCmd = f'timeout --signal=SIGKILL {timeout}' if timeout != 0 else ""
-    cmd = f"{timeoutCmd} {python2_bin} scripts/run_anapsid -e {summary_file} -q ../../{query} -p naive -s False -o False -d SSGM -a True -r ../../{out_result} -z ../../{Path(stats).parent}/ask.txt -y ../../{Path(stats).parent}/planning_time.txt -x ../../{query_plan} -v ../../{out_source_selection} -u ../../{Path(stats).parent}/source_selection_time.txt -n ../../{Path(stats).parent}/exec_time.txt -c {str(noexec)}"
+    cmd = f"{environment_settings} {timeoutCmd} {python2_bin} scripts/run_anapsid -e {summary_file} -q ../../{query} -p naive -s False -o False -d SSGM -a True -r ../../{out_result} -z ../../{Path(stats).parent}/ask.txt -y ../../{Path(stats).parent}/planning_time.txt -x ../../{query_plan} -v ../../{out_source_selection} -u ../../{Path(stats).parent}/source_selection_time.txt -n ../../{Path(stats).parent}/exec_time.txt -c {str(noexec)}"
 
     print("=== ANAPSID ===")
     print(cmd)
@@ -133,7 +134,7 @@ def run_benchmark(ctx: click.Context, eval_config, query, out_result, out_source
     
     # Set the maximum amount of memory to be used by the subprocess in bytes
     os.chdir(app_dir)
-    anapsid_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    anapsid_proc = subprocess.Popen(cmd.strip(), shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.chdir(old_dir)
     
     failed_reason = None

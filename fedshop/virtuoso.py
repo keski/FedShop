@@ -189,6 +189,10 @@ def remove_sparql_host(ctx: click.Context, container_name, isql, graph_uri, host
 def remove_sparql_endpoint(ctx: click.Context, container_name, isql, vhost, lhost, lpath):
     exec_cmd = f"DB.DBA.VHOST_REMOVE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\') ;"
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
+
+    # Remove from DB.DBA.SYS_SPARQL_HOST
+    exec_cmd = f"DELETE FROM DB.DBA.SYS_SPARQL_HOST WHERE SH_HOST = \'{vhost}:{lhost}\' ;"
+    ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
     
 @cli.command()
 @click.option("--container-name", type=click.STRING)
@@ -204,14 +208,14 @@ def create_sparql_endpoint(ctx: click.Context, container_name, isql, host, graph
 
     ctx.invoke(remove_sparql_endpoint, container_name=container_name, isql=isql, vhost=vhost, lhost=lhost, lpath=lpath)
     
-    #exec_cmd = f"DB.DBA.VHOST_DEFINE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_brws=>1, is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
-    exec_cmd = f"DB.DBA.VHOST_DEFINE(lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
+    exec_cmd = f"DB.DBA.VHOST_DEFINE(vhost=>\'{vhost}\', lhost=>\'{lhost}\', lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
+    #exec_cmd = f"DB.DBA.VHOST_DEFINE(lpath=>\'{lpath}\', ppath=>\'/!sparql/\', is_dav=>1, vsp_user=>\'dba\',opts=>vector (\'browse_sheet\', \'\', \'noinherit\', \'yes\')) ;"
     ctx.invoke(isql_exec, container_name=container_name, isql=isql, exec=exec_cmd)
 
     #ctx.invoke(remove_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=host)
     if vhost == "*ini*": vhost = "localhost"
     if vport == "*ini*": vport = "8890"
-    sh_host = f"{vhost}:{vport}{lpath}" # e.g localhost:8890/vendor0/sparql
+    sh_host = f"{vhost}:{vport}" # e.g localhost:8890/vendor0/sparql
 
     ctx.invoke(update_sparql_host, container_name=container_name, isql=isql, graph_uri=graph_uri, host=sh_host, on_duplicate=on_duplicate)
 
