@@ -50,7 +50,7 @@ A first evaluation of existing SPARQL Federation engines on **FedShop200** compu
 
 The FedShop Data Generator is defined as three  [WatDiv](https://dsg.uwaterloo.ca/watdiv/) template models in [experiments/bsbm/model](experiments/bsbm/model/). These models follow the [BSBM](http://wbsg.informatik.uni-mannheim.de/bizer/berlinsparqlbenchmark/) specification as closely as possible. Using WatDiv models allows changing the schema easily through the configuration file [`experiments/bsbm/config.yaml`](experiments/bsbm/config.yaml).
 
-Most of the parameters of FedShop are set in [`experiments/bsbm/config.yaml`](experiments/bsbm/config.yaml). It includes the number of products to generate, the number of vendors and rating sites. 
+Most of the parameters of FedShop are set in [`experiments/bsbm/snakemake/config.yaml`](experiments/bsbm/snakemake/config.yaml). It includes the number of products to generate, the number of vendors and rating sites. 
 
 Basic statistics about the default configuration of FedShop are available in the [jupyter notebook](Realistic_Synthetic_Federated.ipynb)
 
@@ -59,7 +59,7 @@ Basic statistics about the default configuration of FedShop are available in the
 Once `config.yaml` properly set, you can launch the generation of the FedShop benchmark with the following command:
 
 ```bash
-python rsfb/benchmark.py generate data|queries experiments/bsbm/config.yaml  [OPTIONS]
+python fedshop/benchmark.py generate data|queries experiments/bsbm/snakefile/config.yaml  [OPTIONS]
 
 OPTIONS:
 --clean [benchmark|metrics|instances][+db]: clean the benchmark|metrics|instances then (optional) destroy all database containers
@@ -88,12 +88,12 @@ Please note:
 
 As the number of federation members can be high, having a SPARQL endpoint per federation member becomes hard. We ingested all shops and rating-sites over a single Virtuoso server as Virtual Endpoints,i.e.,  each shop and rating-site has its own Virtual SPARQL endpoint. The different configurations relative to Batch(i) are available to configure a given federated-query engine. It is possible at this stage to run all FedShop Benchmark with [Kobe](https://github.com/semagrow/kobe). However, we also provide a benchmark runner based on Snakemake that is convenient for managing failures during the execution of the benchmark.
 
-Federated-query engines must implement a [template](rsfb/engines/TemplateEngine.py) to be integrated in the evaluation workflow. Many templates are already written in [`rsfb/engines/`](rsfb/engines/). Once integrated, 
+Federated-query engines must implement a [template](fedshop/engines/TemplateEngine.py) to be integrated in the evaluation workflow. Many templates are already written in [`fedshop/engines/`](fedshop/engines/). Once integrated, 
 the engine to be tested must be declared in `experiments/bsbm/config.yaml` to run.
 
 The following command allows to launch the evaluation:
 ```bash
-python rsfb/benchmark.py evaluate experiments/bsbm/config.yaml --rerun-incomplete [OPTIONS]
+python fedshop/benchmark.py evaluate experiments/bsbm/snakemake/config.yaml --rerun-incomplete [OPTIONS]
 
 OPTIONS:
 --clean [benchmark|metrics|instances][+db]: clean the benchmark|metrics|instances then (optional) destroy all database containers
@@ -107,8 +107,8 @@ Our [jupyter notebook](FedShop_Evaluation.ipynb) is already written to read resu
 
 - [Load](https://github.com/mhoangvslev/RSFB/wiki/Quick-tutorial#saveload-model) our [basic model]() and mark both the generation and evaluation phases as "completed":
 ```bash
-python rsfb/benchmark.py generate data|queries experiments/bsbm/config.yaml --touch
-python rsfb/benchmark.py evaluate experiments/bsbm/config.yaml --touch
+python fedshop/benchmark.py generate data|queries experiments/bsbm/config.yaml --touch
+python fedshop/benchmark.py evaluate experiments/bsbm/config.yaml --touch
 ```
 
 - Register your engine's repo as a submodule:
@@ -141,7 +141,7 @@ cp TemplateEngine.py <your_engine>.py
 
 - Use [evaluate command](https://github.com/mhoangvslev/RSFB/wiki/Quick-tutorial#generationevaluation) to benchmark your engine:
 ```bash
-python rsfb/benchmark.py evaluate experiments/bsbm/config.yaml --clean metrics
+python fedshop/benchmark.py evaluate experiments/bsbm/config.yaml --clean metrics
 
 ```
 
@@ -155,16 +155,16 @@ python rsfb/benchmark.py evaluate experiments/bsbm/config.yaml --clean metrics
 rm -rf .snakemake
 
 # Continue the workflow if interrupted 
-python rsfb/benchmark.py generate|evaluate experiments/bsbm/config.yaml --rerun-incomplete
+python fedshop/benchmark.py generate|evaluate experiments/bsbm/snakemake/config.yaml --rerun-incomplete
 
 # Delete everything and restart
-python rsfb/benchmark.py generate|evaluate experiments/bsbm/config.yaml --rerun-incomplete --clean all
+python fedshop/benchmark.py generate|evaluate experiments/bsbm/snakemake/config.yaml --rerun-incomplete --clean all
 
 # Keep the data but remove the intermediary artefacts and db containers.
-python rsfb/benchmark.py generate data|queries experiments/bsbm/config.yaml --rerun-incomplete --clean benchmark+db
+python fedshop/benchmark.py generate data|queries experiments/bsbm/snakemake/config.yaml --rerun-incomplete --clean benchmark+db
 
 # Only remove the metrics files, applicable when you need to rerun some of the steps
-python rsfb/benchmark.py generate data|queries experiments/bsbm/config.yaml --rerun-incomplete --clean metrics
+python fedshop/benchmark.py generate data|queries experiments/bsbm/snakemake/config.yaml --rerun-incomplete --clean metrics
 
 ```
 
